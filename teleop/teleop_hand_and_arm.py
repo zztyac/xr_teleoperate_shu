@@ -1,3 +1,5 @@
+# python teleop_hand_and_arm.py --record
+
 import time
 import argparse
 from multiprocessing import Value, Array, Lock
@@ -199,11 +201,16 @@ if __name__ == '__main__':
             from teleop.robot_control.robot_hand_brainco import Brainco_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
+            left_brainco_index_button = Value('b', False, lock = True)
+            right_brainco_index_button = Value('b', False, lock = True)
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
             hand_ctrl = Brainco_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim,
+                                           control_mode=args.input_mode,
+                                           left_index_button=left_brainco_index_button,
+                                           right_index_button=right_brainco_index_button)
         else:
             pass
         
@@ -302,6 +309,11 @@ if __name__ == '__main__':
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+            elif args.ee == "brainco" and args.input_mode == "controller":
+                with left_brainco_index_button.get_lock():
+                    left_brainco_index_button.value = tele_data.left_ctrl_bButton
+                with right_brainco_index_button.get_lock():
+                    right_brainco_index_button.value = tele_data.right_ctrl_bButton
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -366,6 +378,16 @@ if __name__ == '__main__':
                         right_ee_state = [dual_gripper_state_array[1]]
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
+                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
+                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
+                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
+                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                elif args.ee == "brainco" and args.input_mode == "controller":
+                    with dual_hand_data_lock:
+                        left_ee_state = dual_hand_state_array[:6]
+                        right_ee_state = dual_hand_state_array[-6:]
+                        left_hand_action = dual_hand_action_array[:6]
+                        right_hand_action = dual_hand_action_array[-6:]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
                         current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
                                                -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,

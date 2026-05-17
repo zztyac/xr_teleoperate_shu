@@ -415,6 +415,80 @@ python teleop_hand_and_arm.py --input-mode hand --ee brainco --frequency 15 --re
 }
 ```
 
+### 5.4 `--input-mode controller --ee brainco`
+
+该模式使用 controller 的 B/Y 类按键控制 BrainCo 固定姿态，不依赖手势 25 点数据。
+
+启动示例：
+
+```bash
+python teleop_hand_and_arm.py --input-mode controller --ee brainco --record
+```
+
+按键映射：
+
+| 按键 | 效果 |
+| --- | --- |
+| `left_ctrl_bButton` | 长按时左手只伸出食指，其余手指闭合；松开后左手全部张开 |
+| `right_ctrl_bButton` | 长按时右手只伸出食指，其余手指闭合；松开后右手全部张开 |
+
+BrainCo qpos 顺序仍是：
+
+```text
+[thumb, thumb_aux, index, middle, ring, pinky]
+```
+
+全部张开：
+
+```text
+[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+```
+
+只伸出食指：
+
+```text
+[1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+```
+
+该模式会完整记录 BrainCo 双手状态/动作，并且像其他 controller 模式一样记录 body 状态和 3 维 body 动作。
+
+单帧核心字段示例：
+
+```json
+{
+  "states": {
+    "left_ee": {
+      "qpos": [0.02, 0.04, 0.10, 0.12, 0.08, 0.05],
+      "qvel": [],
+      "torque": []
+    },
+    "right_ee": {
+      "qpos": [0.03, 0.05, 0.11, 0.10, 0.07, 0.04],
+      "qvel": [],
+      "torque": []
+    },
+    "body": {
+      "qpos": [0.01, -0.02, 0.00, 0.08, -0.05, 0.03]
+    }
+  },
+  "actions": {
+    "left_ee": {
+      "qpos": [1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+      "qvel": [],
+      "torque": []
+    },
+    "right_ee": {
+      "qpos": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "qvel": [],
+      "torque": []
+    },
+    "body": {
+      "qpos": [0.12, -0.03, -0.06]
+    }
+  }
+}
+```
+
 ## 6. `--input-mode hand --ee inspire_dfx`
 
 启动示例：
@@ -961,6 +1035,7 @@ python teleop_hand_and_arm.py --input-mode hand --ee brainco --sim --record
 
 ```text
 hand + brainco
+controller + brainco
 hand + inspire_dfx
 hand + inspire_ftp
 hand + dex3
@@ -972,7 +1047,6 @@ controller + dex1
 
 | 组合 | 结果 |
 | --- | --- |
-| `controller + brainco` | `left_ee/right_ee` 为空数组 |
 | `controller + dex3` | `left_ee/right_ee` 为空数组 |
 | `controller + inspire_dfx` | `left_ee/right_ee` 为空数组 |
 | `controller + inspire_ftp` | `left_ee/right_ee` 为空数组 |
@@ -1049,21 +1123,28 @@ XR 层 `TeleData` 实际可以提供更多数据，但当前录制逻辑没有�
 | `left_ctrl_triggerValue` | `float` | 否，`dex1 + controller` 用于夹爪控制 |
 | `left_ctrl_squeeze` | `bool` | 否 |
 | `left_ctrl_aButton` | `bool` | 否 |
-| `left_ctrl_bButton` | `bool` | 否 |
+| `left_ctrl_bButton` | `bool` | 否，`controller + brainco` 用于左手固定食指姿态控制 |
 | `left_ctrl_thumbstick` | `bool` | 否，用于双摇杆急停判断 |
 | `left_ctrl_thumbstickValue` | `(2,)` | 否，`controller + dex1` 下生成 body 动作 |
 | `right_ctrl_triggerValue` | `float` | 否，`dex1 + controller` 用于夹爪控制 |
 | `right_ctrl_aButton` | `bool` | 否，用于退出遥操作 |
+| `right_ctrl_bButton` | `bool` | 否，`controller + brainco` 用于右手固定食指姿态控制 |
 | `right_ctrl_thumbstickValue` | `(2,)` | 否，`controller + dex1` 下生成 body 动作 |
 
 如果后续需要训练模型直接使用头姿、腕部 SE(3)、25 点手部轨迹、pinch/squeeze 或手柄按钮，需要扩展 `states` 或新增 `observations` 字段；当前 `data.json` 不保存这些原始 XR 字段。
 
 ## 14. 针对车内物理按键采集的建议模式
 
-当前任务是车内物理按键按压测试，使用 BrainCo 灵巧手，建议使用：
+当前任务是车内物理按键按压测试，使用 BrainCo 灵巧手。如果使用手势追踪，建议使用：
 
 ```bash
 python teleop_hand_and_arm.py --record
+```
+
+如果使用手柄 B/Y 键触发固定食指姿态，建议使用：
+
+```bash
+python teleop_hand_and_arm.py --input-mode controller --ee brainco --record
 ```
 
 或者显式配置：
@@ -1104,4 +1185,3 @@ action:
 - `actions.right_ee.qpos` 或 `actions.left_ee.qpos`：学习手指闭合/按压目标
 - `states.right_ee.qpos` 或 `states.left_ee.qpos`：反馈实际手指状态
 - `actions.right_arm.qpos` 或 `actions.left_arm.qpos`：学习手腕和手臂靠近按键的轨迹
-

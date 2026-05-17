@@ -13,6 +13,8 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 brainco_Num_Motors = 6
+BRAINCO_OPEN_Q = np.zeros(brainco_Num_Motors)
+BRAINCO_INDEX_ONLY_Q = np.array([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
 kTopicbraincoLeftCommand = "rt/brainco/left/cmd"
 kTopicbraincoLeftState = "rt/brainco/left/state"
 kTopicbraincoRightCommand = "rt/brainco/right/cmd"
@@ -20,17 +22,22 @@ kTopicbraincoRightState = "rt/brainco/right/state"
 
 class Brainco_Controller:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
-                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False,
+                       control_mode = "hand", left_index_button = None, right_index_button = None):
         logger_mp.info("Initialize Brainco_Controller...")
         self.fps = fps
         self.hand_sub_ready = False
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
+        self.control_mode = control_mode
 
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
+        if self.control_mode == "hand":
+            if not self.Unit_Test:
+                self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
+            else:
+                self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
         else:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
+            self.hand_retargeting = None
 
 
         # initialize handcmd publisher and handstate subscriber
@@ -59,11 +66,19 @@ class Brainco_Controller:
         logger_mp.info("[brainco_Controller] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array))
+                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array,
+                                                                          self.control_mode, left_index_button, right_index_button))
         hand_control_process.daemon = True
         hand_control_process.start()
 
         logger_mp.info("Initialize brainco_Controller OK!")
+
+    @staticmethod
+    def _read_button(button):
+        if button is None:
+            return False
+        with button.get_lock():
+            return bool(button.value)
 
     def _subscribe_hand_state(self):
         while True:
@@ -93,11 +108,12 @@ class Brainco_Controller:
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None):
+                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None,
+                              control_mode = "hand", left_index_button = None, right_index_button = None):
         self.running = True
 
-        left_q_target  = np.full(brainco_Num_Motors, 0)
-        right_q_target = np.full(brainco_Num_Motors, 0)
+        left_q_target  = BRAINCO_OPEN_Q.copy()
+        right_q_target = BRAINCO_OPEN_Q.copy()
 
         # initialize brainco hand's cmd msg
         self.left_hand_msg  = MotorCmds_()
@@ -115,41 +131,46 @@ class Brainco_Controller:
         try:
             while self.running:
                 start_time = time.time()
-                # get dual hand state
-                with left_hand_array.get_lock():
-                    left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
-                with right_hand_array.get_lock():
-                    right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
 
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
-                    ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
-                    ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
+                if control_mode == "controller":
+                    left_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(left_index_button) else BRAINCO_OPEN_Q.copy()
+                    right_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(right_index_button) else BRAINCO_OPEN_Q.copy()
+                else:
+                    # get dual hand state
+                    with left_hand_array.get_lock():
+                        left_hand_data  = np.array(left_hand_array[:]).reshape(25, 3).copy()
+                    with right_hand_array.get_lock():
+                        right_hand_data = np.array(right_hand_array[:]).reshape(25, 3).copy()
 
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
-                    right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
+                        ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
+                        ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 
-                    # In the official document, the angles are in the range [0, 1] ==> 0.0: fully open  1.0: fully closed
-                    # The q_target now is in radians, ranges:
-                    #     - idx 0:   0~1.52
-                    #     - idx 1:   0~1.05
-                    #     - idx 2~5: 0~1.47
-                    # We normalize them using (max - value) / range
-                    def normalize(val, min_val, max_val):
-                        return 1.0 - np.clip((max_val - val) / (max_val - min_val), 0.0, 1.0)
+                        left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
+                        right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
-                    for idx in range(brainco_Num_Motors):
-                        if idx == 0:
-                            left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.52)
-                            right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.52)
-                        elif idx == 1:
-                            left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.05)
-                            right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.05)
-                        elif idx >= 2:
-                            left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.47)
-                            right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.47)
+                        # In the official document, the angles are in the range [0, 1] ==> 0.0: fully open  1.0: fully closed
+                        # The q_target now is in radians, ranges:
+                        #     - idx 0:   0~1.52
+                        #     - idx 1:   0~1.05
+                        #     - idx 2~5: 0~1.47
+                        # We normalize them using (max - value) / range
+                        def normalize(val, min_val, max_val):
+                            return 1.0 - np.clip((max_val - val) / (max_val - min_val), 0.0, 1.0)
+
+                        for idx in range(brainco_Num_Motors):
+                            if idx == 0:
+                                left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.52)
+                                right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.52)
+                            elif idx == 1:
+                                left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.05)
+                                right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.05)
+                            elif idx >= 2:
+                                left_q_target[idx]  = normalize(left_q_target[idx], 0.0, 1.47)
+                                right_q_target[idx] = normalize(right_q_target[idx], 0.0, 1.47)
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))    
