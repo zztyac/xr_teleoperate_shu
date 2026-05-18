@@ -1,4 +1,8 @@
-# python teleop_hand_and_arm.py --record
+# python teleop_hand_and_arm.py --motion --record 
+
+# python -m teleimager.image_server --rc
+# cd ~/xr_teleoperate_shu/teleop/teleimager/src python -m teleimager.image_client --host 192.168.123.164
+
 
 import time
 import argparse
@@ -75,8 +79,8 @@ def get_state() -> dict:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 15.0, help = 'control and record \'s frequency')
-    parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
+    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
@@ -93,7 +97,7 @@ if __name__ == '__main__':
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'vehicle_physical_button_press', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'Press in-car physical buttons with the BrainCo dexterous hand.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'Collect 15 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
+    parser.add_argument('--task-desc', type = str, default = 'Collect 30 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
@@ -121,6 +125,8 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
+        left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
+        right_wrist_camera_enabled = camera_config.get('right_wrist_camera', {}).get('enable_zmq', False)
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
@@ -281,10 +287,10 @@ if __name__ == '__main__':
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
-            if camera_config['left_wrist_camera']['enable_zmq']:
+            if left_wrist_camera_enabled:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
-            if camera_config['right_wrist_camera']['enable_zmq']:
+            if right_wrist_camera_enabled:
                 if args.record:
                     right_wrist_img = img_client.get_right_wrist_frame()
 
@@ -422,12 +428,12 @@ if __name__ == '__main__':
                             colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
                         else:
                             logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
+                        if left_wrist_camera_enabled:
                             if left_wrist_img is not None:
                                 colors[f"color_{2}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
-                        if camera_config['right_wrist_camera']['enable_zmq']:
+                        if right_wrist_camera_enabled:
                             if right_wrist_img is not None:
                                 colors[f"color_{3}"] = right_wrist_img.bgr
                             else:
@@ -437,12 +443,12 @@ if __name__ == '__main__':
                             colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
+                        if left_wrist_camera_enabled:
                             if left_wrist_img is not None:
                                 colors[f"color_{1}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
-                        if camera_config['right_wrist_camera']['enable_zmq']:
+                        if right_wrist_camera_enabled:
                             if right_wrist_img is not None:
                                 colors[f"color_{2}"] = right_wrist_img.bgr
                             else:
