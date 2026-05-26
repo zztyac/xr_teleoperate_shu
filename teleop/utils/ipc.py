@@ -25,6 +25,12 @@ logger_mp = logging_mp.getLogger(__name__)
         "cmd": "CMD_RECORD_TOGGLE"
     }
 
+4) switch the current button subtask
+    {
+        "reqid": unique id,
+        "cmd": "CMD_SUBTASK_NEXT" | "CMD_SUBTASK_PREV" | "CMD_SUBTASK_1" | ... | "CMD_SUBTASK_5"
+    }
+
 # Server → Client (Reply)
 1) if ok
     {
@@ -64,6 +70,13 @@ class IPC_Server:
         "CMD_START": "r",          # launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_SUBTASK_NEXT": "n",
+        "CMD_SUBTASK_PREV": "p",
+        "CMD_SUBTASK_1": "1",
+        "CMD_SUBTASK_2": "2",
+        "CMD_SUBTASK_3": "3",
+        "CMD_SUBTASK_4": "4",
+        "CMD_SUBTASK_5": "5",
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):

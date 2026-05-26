@@ -1,11 +1,60 @@
-# python teleop_hand_and_arm.py --motion --record 
+# 车内物理按键数据采集
+#
+# 使用真实相机时，先启动图像服务：
+#   python -m teleimager.image_server --rs
+#   python -m teleimager.image_client --host 192.168.123.164
+# 启动遥操作和数据录制：
+#   python teleop/teleop_hand_and_arm.py \
+#     --record \
+#     --task-name vehicle_physical_button_press \
+#     --input-mode hand \
+#     --ee brainco \
+#     --frequency 30
+#
+# 如需运动模式，可使用：
+#   python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press --initial-target-q "[0.127009, 0.085807, 0.282228, 0.487914, 0.014477, -0.415984, -0.002001, -0.060712, -0.552952, -0.284278, 0.418465, 0.35224, 0.132402,0.56707]"
+#   python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
+# 
+# 车内初始姿态："[0.127009, 0.085807, 0.282228, 0.487914, 0.014477, -0.415984, -0.002001, -0.060712, -0.552952, -0.284278, 0.418465, 0.35224, 0.132402,0.56707]"
+#
+# 运行时按键：
+#   r      开始机器人跟随 XR 运动
+#   q      停止并退出程序
+#   s      开始录制当前 episode，或保存正在录制的 episode
+#   n / p  录制前切换到下一个 / 上一个按键子任务
+#   1-5    录制前直接选择对应的按键子任务
+#
+# 每个 episode 会把当前选择的子任务写入 data.json -> text。
+# 子任务顺序如下，goal 保持英文，作为训练用语言标签：
+#   1. front_windshield_defrost
+#      goal: Press the front windshield defrost button once.
+#   2. ac_temperature_down
+#      goal: Press the air conditioning temperature down button once.
+#   3. fan_speed_down
+#      goal: Press the fan speed down button once.
+#   4. trunk_open_long_press
+#      goal: Long-press the trunk open button until the trunk starts opening.
+#   5. sunshade_open_long_press
+#      goal: Long-press the sunshade open button until the sunshade starts opening.
+#
+# 推荐采集流程：
+#   1. 按 r 开始机器人跟随。
+#   2. 按 1，再按 s 录制前窗除雾；录完后再按 s 保存。
+#   3. 按 2，再按 s 录制空调温度降低；录完后再按 s 保存。
+#   4. 按 3，再按 s 录制空调风速降低；录完后再按 s 保存。
+#   5. 按 4，再按 s 录制长按打开后备箱；录完后再按 s 保存。
+#   6. 按 5，再按 s 录制长按打开遮阳板；录完后再按 s 保存。
+#
+# 注意：
+#   - 当前子任务会在 create_episode() 前写入 recorder.text。
+#   - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
+#   - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
 
-# python -m teleimager.image_server --rc
-# cd ~/xr_teleoperate_shu/teleop/teleimager/src python -m teleimager.image_client --host 192.168.123.164
 
 
 import time
 import argparse
+import ast
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -42,6 +91,7 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+CURRENT_BUTTON_SUBTASK_IDX = 0
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -53,6 +103,63 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  -------        ---------                -----------                 -----------            ---------
 #  ==> manual: when READY is True, set RECORD_TOGGLE=True to transition.
 #  --> auto  : Auto-transition after saving data.
+SHORT_PRESS_STEPS = "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+LONG_PRESS_STEPS = "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press and hold the button; step4: keep holding until the target function starts; step5: release the button; step6: return to a safe pose;"
+
+BUTTON_SUBTASKS = [
+    {
+        "id": "front_windshield_defrost",
+        "goal": "Press the front windshield defrost button once.",
+        "desc": "Collect a demonstration for the in-car physical button task: front windshield defrost.",
+        "steps": SHORT_PRESS_STEPS,
+    },
+    {
+        "id": "ac_temperature_down",
+        "goal": "Press the air conditioning temperature down button once.",
+        "desc": "Collect a demonstration for the in-car physical button task: air conditioning temperature down.",
+        "steps": SHORT_PRESS_STEPS,
+    },
+    {
+        "id": "fan_speed_down",
+        "goal": "Press the fan speed down button once.",
+        "desc": "Collect a demonstration for the in-car physical button task: fan speed down.",
+        "steps": SHORT_PRESS_STEPS,
+    },
+    {
+        "id": "trunk_open_long_press",
+        "goal": "Long-press the trunk open button until the trunk starts opening.",
+        "desc": "Collect a demonstration for the in-car physical button task: trunk open by long press.",
+        "steps": LONG_PRESS_STEPS,
+    },
+    {
+        "id": "sunshade_open_long_press",
+        "goal": "Long-press the sunshade open button until the sunshade starts opening.",
+        "desc": "Collect a demonstration for the in-car physical button task: sunshade open by long press.",
+        "steps": LONG_PRESS_STEPS,
+    },
+]
+
+
+def get_current_button_subtask() -> dict:
+    return BUTTON_SUBTASKS[CURRENT_BUTTON_SUBTASK_IDX]
+
+
+def log_current_button_subtask(prefix="Selected"):
+    subtask = get_current_button_subtask()
+    logger_mp.info(
+        f"{prefix} button subtask [{CURRENT_BUTTON_SUBTASK_IDX + 1}/{len(BUTTON_SUBTASKS)}] "
+        f"{subtask['id']}: {subtask['goal']}"
+    )
+
+
+def select_button_subtask(index: int):
+    global CURRENT_BUTTON_SUBTASK_IDX
+    if RECORD_RUNNING:
+        logger_mp.warning("Cannot switch button subtask while recording. Save the current episode first.")
+        return
+    CURRENT_BUTTON_SUBTASK_IDX = index % len(BUTTON_SUBTASKS)
+    log_current_button_subtask()
+
 
 def on_press(key):
     global STOP, START, RECORD_TOGGLE
@@ -63,18 +170,55 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key == 'n':
+        select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX + 1)
+    elif key == 'p':
+        select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX - 1)
+    elif key in ('1', '2', '3', '4', '5'):
+        select_button_subtask(int(key) - 1)
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
 def get_state() -> dict:
     """Return current heartbeat state"""
     global START, STOP, RECORD_RUNNING, READY
+    subtask = get_current_button_subtask()
     return {
         "START": START,
         "STOP": STOP,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
+        "BUTTON_SUBTASK_INDEX": CURRENT_BUTTON_SUBTASK_IDX,
+        "BUTTON_SUBTASK_ID": subtask["id"],
+        "BUTTON_SUBTASK_GOAL": subtask["goal"],
     }
+
+ARM_TARGET_DOF = {
+    "G1_29": 14,
+    "G1_23": 10,
+    "H1_2": 14,
+    "H1": 8,
+    "H2": 14,
+}
+
+
+def parse_initial_target_q(raw_value, expected_dof: int):
+    if raw_value is None:
+        return None
+
+    try:
+        parsed = ast.literal_eval(raw_value)
+    except (SyntaxError, ValueError):
+        parsed = raw_value.split(",")
+
+    if isinstance(parsed, (int, float)):
+        values = [float(parsed)]
+    else:
+        values = [float(value) for value in parsed]
+
+    if len(values) != expected_dof:
+        raise ValueError(f"initial_target_q for this arm must have {expected_dof} values, got {len(values)}.")
+    return values
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -83,6 +227,8 @@ if __name__ == '__main__':
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
+    parser.add_argument('--initial-target-q', '--initial_target_q', dest='initial_target_q', type=str, default=None,
+                        help='Initial dual-arm joint target, e.g. "[0, 0, ...]" or "0,0,...". Default is zeros for the selected arm.')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
@@ -94,13 +240,18 @@ if __name__ == '__main__':
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
-    parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
+    parser.add_argument('--task-dir', type = str, default = '/mnt/data/zty/json_data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'vehicle_physical_button_press', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'Press in-car physical buttons with the BrainCo dexterous hand.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'Collect 30 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    try:
+        initial_target_q = parse_initial_target_q(args.initial_target_q, ARM_TARGET_DOF[args.arm])
+    except ValueError as e:
+        parser.error(str(e))
+    button_subtask_mode = args.record and args.task_name == 'vehicle_physical_button_press'
     logger_mp.debug(f"args: {args}")
 
     try:
@@ -125,6 +276,7 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
+        right_side_camera_enabled = camera_config.get('right_side_camera', {}).get('enable_zmq', False)
         left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
         right_wrist_camera_enabled = camera_config.get('right_wrist_camera', {}).get('enable_zmq', False)
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
@@ -154,19 +306,19 @@ if __name__ == '__main__':
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
-            arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
         elif args.arm == "H1_2":
             arm_ik = H1_2_ArmIK()
-            arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
-            arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+            arm_ctrl = H1_ArmController(simulation_mode=args.sim, initial_target_q=initial_target_q)
         elif args.arm == "H2":
             arm_ik = H2_ArmIK()
-            arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
 
         # end-effector
         if args.ee == "dex3":
@@ -259,6 +411,9 @@ if __name__ == '__main__':
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            if button_subtask_mode:
+                logger_mp.info("🟡  Press [n]/[p] to switch button subtask, or [1]-[5] to select it directly before recording.")
+                log_current_button_subtask(prefix="Initial")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
@@ -275,6 +430,7 @@ if __name__ == '__main__':
         arm_ctrl.speed_gradual_max()
 
         head_img = None
+        right_side_img = None
         left_wrist_img = None
         right_wrist_img = None
 
@@ -287,6 +443,9 @@ if __name__ == '__main__':
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            if right_side_camera_enabled:
+                if args.record:
+                    right_side_img = img_client.get_right_side_frame()
             if left_wrist_camera_enabled:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -298,6 +457,14 @@ if __name__ == '__main__':
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
+                    if button_subtask_mode:
+                        subtask = get_current_button_subtask()
+                        recorder.text = {
+                            "goal": subtask["goal"],
+                            "desc": subtask["desc"],
+                            "steps": subtask["steps"],
+                        }
+                        log_current_button_subtask(prefix="Recording")
                     if recorder.create_episode():
                         RECORD_RUNNING = True
                     else:
@@ -438,6 +605,11 @@ if __name__ == '__main__':
                                 colors[f"color_{3}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
+                        if right_side_camera_enabled:
+                            if right_side_img is not None:
+                                colors[f"color_{4}"] = right_side_img.bgr
+                            else:
+                                logger_mp.warning("Right side image is None!")
                     else:
                         if head_img is not None:
                             colors[f"color_{0}"] = head_img.bgr
@@ -453,6 +625,11 @@ if __name__ == '__main__':
                                 colors[f"color_{2}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
+                        if right_side_camera_enabled:
+                            if right_side_img is not None:
+                                colors[f"color_{3}"] = right_side_img.bgr
+                            else:
+                                logger_mp.warning("Right side image is None!")
                     states = {
                         "left_arm": {                                                                    
                             "qpos":   left_arm_state.tolist(),    # numpy.array -> list

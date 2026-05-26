@@ -12,6 +12,8 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
+assets_dir = os.path.join(parent2_dir, "assets")
+cache_dir = os.path.join(parent2_dir, "teleop", "robot_control")
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
@@ -23,14 +25,10 @@ class G1_29_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "g1_29_model_cache.pkl"
+        self.cache_path = os.path.join(cache_dir, "g1_29_model_cache.pkl")
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../assets/g1/'
-        else:
-            self.urdf_path = '../../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../../assets/g1/'
+        self.urdf_path = os.path.join(assets_dir, "g1", "g1_body29_hand14.urdf")
+        self.model_dir = os.path.join(assets_dir, "g1")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -317,14 +315,10 @@ class G1_23_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "g1_23_model_cache.pkl"
+        self.cache_path = os.path.join(cache_dir, "g1_23_model_cache.pkl")
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body23.urdf'
-            self.model_dir = '../assets/g1/'
-        else:
-            self.urdf_path = '../../assets/g1/g1_body23.urdf'
-            self.model_dir = '../../assets/g1/'
+        self.urdf_path = os.path.join(assets_dir, "g1", "g1_body23.urdf")
+        self.model_dir = os.path.join(assets_dir, "g1")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -597,14 +591,10 @@ class H1_2_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "h1_2_model_cache.pkl"
+        self.cache_path = os.path.join(cache_dir, "h1_2_model_cache.pkl")
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/h1_2/h1_2.urdf'
-            self.model_dir = '../assets/h1_2/'
-        else:
-            self.urdf_path = '../../assets/h1_2/h1_2.urdf'
-            self.model_dir = '../../assets/h1_2/'
+        self.urdf_path = os.path.join(assets_dir, "h1_2", "h1_2.urdf")
+        self.model_dir = os.path.join(assets_dir, "h1_2")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -900,14 +890,10 @@ class H1_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "h1_model_cache.pkl"
+        self.cache_path = os.path.join(cache_dir, "h1_model_cache.pkl")
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/h1/h1_with_hand.urdf'
-            self.model_dir = '../assets/h1/'
-        else:
-            self.urdf_path = '../../assets/h1/h1_with_hand.urdf'
-            self.model_dir = '../../assets/h1/'
+        self.urdf_path = os.path.join(assets_dir, "h1", "h1_with_hand.urdf")
+        self.model_dir = os.path.join(assets_dir, "h1")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -1207,14 +1193,10 @@ class H2_ArmIK:
         self.Visualization = Visualization
 
         # fixed cache file path
-        self.cache_path = "h2_model_cache.pkl"
+        self.cache_path = os.path.join(cache_dir, "h2_model_cache.pkl")
 
-        if not self.Unit_Test:
-            self.urdf_path = "../assets/h2/H2.urdf"
-            self.model_dir = "../assets/h2/"
-        else:
-            self.urdf_path = "../../assets/h2/H2.urdf"
-            self.model_dir = "../../assets/h2/"
+        self.urdf_path = os.path.join(assets_dir, "h2", "H2.urdf")
+        self.model_dir = os.path.join(assets_dir, "h2")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):

@@ -26,6 +26,7 @@ class Brainco_Controller:
                        control_mode = "hand", left_index_button = None, right_index_button = None):
         logger_mp.info("Initialize Brainco_Controller...")
         self.fps = fps
+        # GAIDONG
         self.hand_sub_ready = False
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
@@ -83,6 +84,7 @@ class Brainco_Controller:
     def _subscribe_hand_state(self):
         while True:
             left_hand_msg  = self.LeftHandState_subscriber.Read()
+            ## 。。。。
             right_hand_msg = self.RightHandState_subscriber.Read()
             self.hand_sub_ready = True
             if left_hand_msg is not None and right_hand_msg is not None:

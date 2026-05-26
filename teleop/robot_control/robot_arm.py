@@ -64,10 +64,20 @@ class DataBuffer:
         with self.lock:
             self.data = data
 
+def _resolve_initial_target_q(initial_target_q, dof: int, controller_name: str):
+    if initial_target_q is None:
+        return np.zeros(dof)
+
+    target_q = np.asarray(initial_target_q, dtype=float).reshape(-1)
+    if target_q.shape[0] != dof:
+        raise ValueError(f"[{controller_name}] initial_target_q must have {dof} values, got {target_q.shape[0]}.")
+    return target_q.copy()
+
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None):
         logger_mp.info("Initialize G1_29_ArmController...")
-        self.q_target = np.zeros(14)
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "G1_29_ArmController")
+        self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
@@ -220,17 +230,17 @@ class G1_29_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
+        '''Move both the left and right arms of the robot to their initial target position.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
+            self.q_target = self.initial_target_q.copy()
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
@@ -345,12 +355,13 @@ class G1_29_JointIndex(IntEnum):
     kNotUsedJoint5 = 34
 
 class G1_23_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
 
         logger_mp.info("Initialize G1_23_ArmController...")
-        self.q_target = np.zeros(10)
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 10, "G1_23_ArmController")
+        self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(10)
 
         self.kp_high = 300.0
@@ -503,17 +514,17 @@ class G1_23_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_23_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
+        '''Move both the left and right arms of the robot to their initial target position.'''
         logger_mp.info("[G1_23_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(10)
+            self.q_target = self.initial_target_q.copy()
             # self.tauff_target = np.zeros(10)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = weight;
@@ -620,12 +631,13 @@ class G1_23_JointIndex(IntEnum):
     kNotUsedJoint5 = 34
 
 class H1_2_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
         
         logger_mp.info("Initialize H1_2_ArmController...")
-        self.q_target = np.zeros(14)
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "H1_2_ArmController")
+        self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(14)
 
         self.kp_high = 300.0
@@ -778,17 +790,17 @@ class H1_2_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in H1_2_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
+        '''Move both the left and right arms of the robot to their initial target position.'''
         logger_mp.info("[H1_2_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
+            self.q_target = self.initial_target_q.copy()
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = weight;
@@ -902,11 +914,12 @@ class H1_2_JointIndex(IntEnum):
     kNotUsedJoint7 = 34
 
 class H1_ArmController:
-    def __init__(self, simulation_mode = False):
+    def __init__(self, simulation_mode = False, initial_target_q = None):
         self.simulation_mode = simulation_mode
         
         logger_mp.info("Initialize H1_ArmController...")
-        self.q_target = np.zeros(8)
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 8, "H1_ArmController")
+        self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(8)
 
         self.kp_high = 300.0
@@ -1040,17 +1053,17 @@ class H1_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in H1_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
+        '''Move both the left and right arms of the robot to their initial target position.'''
         logger_mp.info("[H1_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(8)
+            self.q_target = self.initial_target_q.copy()
             # self.tauff_target = np.zeros(8)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
                 logger_mp.info("[H1_ArmController] both arms have reached the home position.")
                 break
             current_attempts += 1
@@ -1122,9 +1135,10 @@ class H1_JointIndex(IntEnum):
     kLeftElbow = 19
 
 class H2_ArmController:
-    def __init__(self, motion_mode=False, simulation_mode=False):
+    def __init__(self, motion_mode=False, simulation_mode=False, initial_target_q = None):
         logger_mp.info("Initialize H2_ArmController...")
-        self.q_target = np.zeros(14)
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "H2_ArmController")
+        self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
@@ -1278,16 +1292,16 @@ class H2_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in H2_JointArmIndex])
 
     def ctrl_dual_arm_go_home(self):
-        """Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero."""
+        """Move both the left and right arms of the robot to their initial target position."""
         logger_mp.info("[H2_ArmController] ctrl_dual_arm_go_home start...")
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
+            self.q_target = self.initial_target_q.copy()
         tolerance = 0.05
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[H2_JointIndex.kNotUsedJoint0].q = weight
