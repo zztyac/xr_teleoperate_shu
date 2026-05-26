@@ -1,60 +1,54 @@
-# 车内物理按键数据采集
-#
-# 使用真实相机时，先启动图像服务：
-#   python -m teleimager.image_server --rs
-#   python -m teleimager.image_client --host 192.168.123.164
-# 启动遥操作和数据录制：
-#   python teleop/teleop_hand_and_arm.py \
-#     --record \
-#     --task-name vehicle_physical_button_press \
-#     --input-mode hand \
-#     --ee brainco \
-#     --frequency 30
-#
-# 如需运动模式，可使用：
-#   python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press --initial-target-q "[0.127009, 0.085807, 0.282228, 0.487914, 0.014477, -0.415984, -0.002001, -0.060712, -0.552952, -0.284278, 0.418465, 0.35224, 0.132402,0.56707]"
-#   python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-# 
-# 车内初始姿态："[0.127009, 0.085807, 0.282228, 0.487914, 0.014477, -0.415984, -0.002001, -0.060712, -0.552952, -0.284278, 0.418465, 0.35224, 0.132402,0.56707]"
-#
-# 运行时按键：
-#   r      开始机器人跟随 XR 运动
-#   q      停止并退出程序
-#   s      开始录制当前 episode，或保存正在录制的 episode
-#   n / p  录制前切换到下一个 / 上一个按键子任务
-#   1-5    录制前直接选择对应的按键子任务
-#
-# 每个 episode 会把当前选择的子任务写入 data.json -> text。
-# 子任务顺序如下，goal 保持英文，作为训练用语言标签：
-#   1. front_windshield_defrost
-#      goal: Press the front windshield defrost button once.
-#   2. ac_temperature_down
-#      goal: Press the air conditioning temperature down button once.
-#   3. fan_speed_down
-#      goal: Press the fan speed down button once.
-#   4. trunk_open_long_press
-#      goal: Long-press the trunk open button until the trunk starts opening.
-#   5. sunshade_open_long_press
-#      goal: Long-press the sunshade open button until the sunshade starts opening.
-#
-# 推荐采集流程：
-#   1. 按 r 开始机器人跟随。
-#   2. 按 1，再按 s 录制前窗除雾；录完后再按 s 保存。
-#   3. 按 2，再按 s 录制空调温度降低；录完后再按 s 保存。
-#   4. 按 3，再按 s 录制空调风速降低；录完后再按 s 保存。
-#   5. 按 4，再按 s 录制长按打开后备箱；录完后再按 s 保存。
-#   6. 按 5，再按 s 录制长按打开遮阳板；录完后再按 s 保存。
-#
-# 注意：
-#   - 当前子任务会在 create_episode() 前写入 recorder.text。
-#   - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
-#   - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
+"""车内物理按键数据采集
 
+使用真实相机时，先启动图像服务：
+  python -m teleimager.image_server --rs
+  python -m teleimager.image_client --host 192.168.123.164
+启动遥操作和数据录制：
+  python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
+  python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
+
+车内初始姿态默认从 teleop/initial_target_poses.json 读取。
+如需切换姿态，可使用 --initial-target-q-name 指定配置中的姿态名。
+
+运行时按键：
+  r      开始机器人跟随 XR 运动
+  q      停止并退出程序
+  s      开始录制当前 episode，或保存正在录制的 episode
+  n / p  录制前切换到下一个 / 上一个按键子任务
+  1-5    录制前直接选择对应的按键子任务
+
+每个 episode 会把当前选择的子任务写入 data.json -> text。
+子任务顺序如下，goal 保持英文，作为训练用语言标签：
+  1. front_windshield_defrost
+     goal: Press the front windshield defrost button once.
+  2. ac_temperature_down
+     goal: Press the air conditioning temperature down button once.
+  3. fan_speed_down
+     goal: Press the fan speed down button once.
+  4. trunk_open_long_press
+     goal: Long-press the trunk open button until the trunk starts opening.
+  5. sunshade_open_long_press
+     goal: Long-press the sunshade open button until the sunshade starts opening.
+
+推荐采集流程：
+  1. 按 r 开始机器人跟随。
+  2. 按 1，再按 s 录制前窗除雾；录完后再按 s 保存。
+  3. 按 2，再按 s 录制空调温度降低；录完后再按 s 保存。
+  4. 按 3，再按 s 录制空调风速降低；录完后再按 s 保存。
+  5. 按 4，再按 s 录制长按打开后备箱；录完后再按 s 保存。
+  6. 按 5，再按 s 录制长按打开遮阳板；录完后再按 s 保存。
+
+注意：
+  - 当前子任务会在 create_episode() 前写入 recorder.text。
+  - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
+  - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
+"""
 
 
 import time
 import argparse
 import ast
+import json
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -66,6 +60,7 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
+INITIAL_TARGET_Q_CONFIG_PATH = os.path.join(current_dir, "initial_target_poses.json")
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
@@ -200,16 +195,20 @@ ARM_TARGET_DOF = {
     "H1": 8,
     "H2": 14,
 }
+INITIAL_TARGET_Q_MISSING = object()
 
 
 def parse_initial_target_q(raw_value, expected_dof: int):
     if raw_value is None:
         return None
 
-    try:
-        parsed = ast.literal_eval(raw_value)
-    except (SyntaxError, ValueError):
-        parsed = raw_value.split(",")
+    if isinstance(raw_value, str):
+        try:
+            parsed = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            parsed = raw_value.split(",")
+    else:
+        parsed = raw_value
 
     if isinstance(parsed, (int, float)):
         values = [float(parsed)]
@@ -220,6 +219,52 @@ def parse_initial_target_q(raw_value, expected_dof: int):
         raise ValueError(f"initial_target_q for this arm must have {expected_dof} values, got {len(values)}.")
     return values
 
+
+def load_named_initial_target_q(config_path: str, pose_name: str, arm: str):
+    if not pose_name or not os.path.exists(config_path):
+        return INITIAL_TARGET_Q_MISSING
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse initial target q file {config_path}: {e}")
+
+    if not isinstance(config, dict):
+        raise ValueError(f"initial target q file {config_path} must contain a JSON object.")
+
+    pose_entry = config.get(pose_name)
+    if pose_entry is None:
+        return INITIAL_TARGET_Q_MISSING
+    if isinstance(pose_entry, dict):
+        return pose_entry.get(arm, INITIAL_TARGET_Q_MISSING)
+    return pose_entry
+
+
+def resolve_initial_target_q(args):
+    expected_dof = ARM_TARGET_DOF[args.arm]
+    if args.initial_target_q is not None:
+        return parse_initial_target_q(args.initial_target_q, expected_dof)
+
+    pose_name = args.initial_target_q_name
+    if pose_name is None and args.record:
+        pose_name = args.task_name
+
+    raw_value = load_named_initial_target_q(args.initial_target_q_file, pose_name, args.arm)
+    if raw_value is INITIAL_TARGET_Q_MISSING:
+        if args.initial_target_q_name is not None:
+            raise ValueError(
+                f"initial target q name '{args.initial_target_q_name}' for arm '{args.arm}' "
+                f"was not found in {args.initial_target_q_file}."
+            )
+        return None
+
+    logger_mp.info(
+        f"Loaded initial_target_q '{pose_name}' for {args.arm} from {args.initial_target_q_file}."
+    )
+    return parse_initial_target_q(raw_value, expected_dof)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -228,7 +273,13 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
     parser.add_argument('--initial-target-q', '--initial_target_q', dest='initial_target_q', type=str, default=None,
-                        help='Initial dual-arm joint target, e.g. "[0, 0, ...]" or "0,0,...". Default is zeros for the selected arm.')
+                        help='Initial dual-arm joint target, e.g. "[0, 0, ...]" or "0,0,...". Overrides the named JSON config.')
+    parser.add_argument('--initial-target-q-file', '--initial-target-pose-file', dest='initial_target_q_file',
+                        type=str, default=INITIAL_TARGET_Q_CONFIG_PATH,
+                        help='JSON file containing named initial dual-arm joint targets.')
+    parser.add_argument('--initial-target-q-name', '--initial-target-pose', dest='initial_target_q_name',
+                        type=str, default=None,
+                        help='Named initial target in the JSON file. Default uses --task-name when --record is enabled.')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
@@ -248,7 +299,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     try:
-        initial_target_q = parse_initial_target_q(args.initial_target_q, ARM_TARGET_DOF[args.arm])
+        initial_target_q = resolve_initial_target_q(args)
     except ValueError as e:
         parser.error(str(e))
     button_subtask_mode = args.record and args.task_name == 'vehicle_physical_button_press'
