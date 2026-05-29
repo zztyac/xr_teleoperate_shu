@@ -2,17 +2,22 @@
 """Replay an EpisodeWriter dataset.
 
 Default dataset:
-    /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0001
+    /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0021/data.json.
 
 Examples:
-    python scripts/replay_episode.py
-    python scripts/replay_episode.py --camera color_0 --camera color_2
+    python scripts/replay_episode.py --execute
+    python scripts/replay_episode.py --camera color_0 --camera color_1 --camera color_2 --camera color_3
     python scripts/replay_episode.py --export-video /tmp/episode_0001.mp4 --no-gui
+
+    python scripts/replay_episode.py --execute --yes --camera color_0 --camera color_1
+
+    python scripts/replay_episode.py --execute --yes --source states --no-gui --fps 30
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import sys
@@ -29,6 +34,15 @@ DEFAULT_EPISODE_DIR = Path(
 )
 DEFAULT_TILE_WIDTH = 640
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INITIAL_TARGET_Q_FILE = REPO_ROOT / "teleop" / "initial_target_poses.json"
+ARM_TARGET_DOF = {
+    "G1_29": 14,
+    "G1_23": 10,
+    "H1_2": 14,
+    "H1": 8,
+    "H2": 14,
+}
+INITIAL_TARGET_Q_MISSING = object()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -120,6 +134,30 @@ def parse_args() -> argparse.Namespace:
         choices=["actions", "states"],
         default="actions",
         help="Replay actions or recorded states to the robot.",
+    )
+    parser.add_argument(
+        "--initial-target-q",
+        "--initial_target_q",
+        dest="initial_target_q",
+        type=str,
+        default=None,
+        help='Initial dual-arm joint target, for example "[0, 0, ...]" or "0,0,...".',
+    )
+    parser.add_argument(
+        "--initial-target-q-file",
+        "--initial-target-pose-file",
+        dest="initial_target_q_file",
+        type=Path,
+        default=DEFAULT_INITIAL_TARGET_Q_FILE,
+        help=f"JSON file containing named initial dual-arm targets. Default: {DEFAULT_INITIAL_TARGET_Q_FILE}",
+    )
+    parser.add_argument(
+        "--initial-target-q-name",
+        "--initial-target-pose",
+        dest="initial_target_q_name",
+        type=str,
+        default=None,
+        help="Named initial target in the JSON file. Defaults to the episode parent directory name.",
     )
     parser.add_argument(
         "--network-interface",
@@ -315,6 +353,84 @@ def extract_dual_hand_q(
     return np.asarray(left, dtype=float), np.asarray(right, dtype=float)
 
 
+def parse_initial_target_q(raw_value: Any, expected_dof: int) -> np.ndarray | None:
+    if raw_value is None:
+        return None
+
+    if isinstance(raw_value, str):
+        try:
+            parsed = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            parsed = raw_value.split(",")
+    else:
+        parsed = raw_value
+
+    if isinstance(parsed, (int, float)):
+        values = [float(parsed)]
+    else:
+        values = [float(value) for value in parsed]
+
+    if len(values) != expected_dof:
+        raise ValueError(
+            f"initial_target_q for this arm must have {expected_dof} values, "
+            f"got {len(values)}."
+        )
+    return np.asarray(values, dtype=float)
+
+
+def load_named_initial_target_q(
+    config_path: Path, pose_name: str | None, arm: str
+) -> Any:
+    if not pose_name or not config_path.exists():
+        return INITIAL_TARGET_Q_MISSING
+
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse initial target q file {config_path}: {exc}")
+
+    if not isinstance(config, dict):
+        raise ValueError(f"initial target q file {config_path} must contain a JSON object.")
+
+    pose_entry = config.get(pose_name)
+    if pose_entry is None:
+        return INITIAL_TARGET_Q_MISSING
+    if isinstance(pose_entry, dict):
+        return pose_entry.get(arm, INITIAL_TARGET_Q_MISSING)
+    return pose_entry
+
+
+def resolve_initial_target_q(args: argparse.Namespace, episode_dir: Path) -> np.ndarray | None:
+    if args.arm == "none":
+        return None
+
+    expected_dof = ARM_TARGET_DOF[args.arm]
+    if args.initial_target_q is not None:
+        target_q = parse_initial_target_q(args.initial_target_q, expected_dof)
+        print("Loaded initial_target_q from --initial-target-q.")
+        return target_q
+
+    pose_name = args.initial_target_q_name or episode_dir.parent.name
+    config_path = args.initial_target_q_file.expanduser().resolve()
+    raw_value = load_named_initial_target_q(config_path, pose_name, args.arm)
+    if raw_value is INITIAL_TARGET_Q_MISSING:
+        if args.initial_target_q_name is not None:
+            raise ValueError(
+                f"initial target q name '{args.initial_target_q_name}' for arm "
+                f"'{args.arm}' was not found in {config_path}."
+            )
+        print(
+            f"[warn] no initial_target_q '{pose_name}' for {args.arm} in {config_path}; "
+            "using controller default.",
+            file=sys.stderr,
+        )
+        return None
+
+    print(f"Loaded initial_target_q '{pose_name}' for {args.arm} from {config_path}.")
+    return parse_initial_target_q(raw_value, expected_dof)
+
+
 def collect_arm_targets(
     frames: list[dict[str, Any]], source: str
 ) -> list[np.ndarray | None]:
@@ -386,7 +502,9 @@ def enter_debug_mode() -> None:
     print(f"Enter debug mode: {'Success' if status == 0 else 'Failed'} {result}")
 
 
-def create_arm_controller(arm_name: str, motion: bool, sim: bool):
+def create_arm_controller(
+    arm_name: str, motion: bool, sim: bool, initial_target_q: np.ndarray | None
+):
     from teleop.robot_control.robot_arm import (
         G1_23_ArmController,
         G1_29_ArmController,
@@ -404,8 +522,8 @@ def create_arm_controller(arm_name: str, motion: bool, sim: bool):
     }
     cls = controllers[arm_name]
     if arm_name == "H1":
-        return cls(simulation_mode=sim)
-    return cls(motion_mode=motion, simulation_mode=sim)
+        return cls(simulation_mode=sim, initial_target_q=initial_target_q)
+    return cls(motion_mode=motion, simulation_mode=sim, initial_target_q=initial_target_q)
 
 
 def sleep_to_rate(start_time: float, fps: float, speed: float) -> None:
@@ -416,7 +534,10 @@ def sleep_to_rate(start_time: float, fps: float, speed: float) -> None:
 
 
 def execute_robot_replay(
+    episode_dir: Path,
     frames: list[dict[str, Any]],
+    camera_keys: list[str],
+    initial_target_q: np.ndarray | None,
     fps: float,
     speed: float,
     source: str,
@@ -430,6 +551,8 @@ def execute_robot_replay(
     max_frame_arm_delta: float,
     allow_large_initial_jump: bool,
     go_home: bool,
+    tile_width: int,
+    show_gui: bool,
 ) -> None:
     use_arm = arm_name != "none"
     use_hand = ee_name != "none"
@@ -456,19 +579,52 @@ def execute_robot_replay(
     if use_arm and not motion and not sim:
         enter_debug_mode()
 
-    arm_ctrl = create_arm_controller(arm_name, motion=motion, sim=sim) if use_arm else None
+    arm_ctrl = (
+        create_arm_controller(
+            arm_name, motion=motion, sim=sim, initial_target_q=initial_target_q
+        )
+        if use_arm
+        else None
+    )
     hand_ctrl = BraincoDirectController() if use_hand else None
     tau = np.zeros(14, dtype=float)
+    if arm_ctrl is not None:
+        arm_ctrl.ctrl_dual_arm(arm_ctrl.get_current_dual_arm_q(), tau)
+    window_name = f"Episode Execute - {episode_dir.name}"
 
     try:
         if arm_ctrl is not None:
             first_arm_target = next(target for target in arm_targets if target is not None)
             current_arm_q = arm_ctrl.get_current_dual_arm_q()
-            initial_delta = float(np.max(np.abs(first_arm_target - current_arm_q)))
-            print(f"current-to-first max arm delta: {initial_delta:.3f} rad")
+            ramp_start_q = current_arm_q
+            if initial_target_q is not None:
+                initial_pose_delta = float(np.max(np.abs(initial_target_q - current_arm_q)))
+                print(f"current-to-configured-initial max arm delta: {initial_pose_delta:.3f} rad")
+                if initial_pose_delta > max_initial_arm_delta and not allow_large_initial_jump:
+                    raise ValueError(
+                        f"Configured initial pose is too far from current pose: "
+                        f"{initial_pose_delta:.3f} > {max_initial_arm_delta:.3f}. "
+                        "Move closer first or use --allow-large-initial-jump after inspection."
+                    )
+
+                initial_ramp_steps = max(1, int(max(ramp_time, 0.0) * fps))
+                print(f"Ramping arm to configured initial pose in {initial_ramp_steps} steps...")
+                for step in range(1, initial_ramp_steps + 1):
+                    loop_start = time.time()
+                    ratio = step / initial_ramp_steps
+                    target = current_arm_q + (initial_target_q - current_arm_q) * ratio
+                    arm_ctrl.ctrl_dual_arm(target, tau)
+                    sleep_to_rate(loop_start, fps=fps, speed=1.0)
+                ramp_start_q = arm_ctrl.get_current_dual_arm_q()
+
+            initial_delta = float(np.max(np.abs(first_arm_target - ramp_start_q)))
+            if initial_target_q is not None:
+                print(f"configured-initial-to-first max arm delta: {initial_delta:.3f} rad")
+            else:
+                print(f"current-to-first max arm delta: {initial_delta:.3f} rad")
             if initial_delta > max_initial_arm_delta and not allow_large_initial_jump:
                 raise ValueError(
-                    f"Initial arm target is too far from current pose: {initial_delta:.3f} "
+                    f"Initial arm target is too far from replay start pose: {initial_delta:.3f} "
                     f"> {max_initial_arm_delta:.3f}. Move closer first or use "
                     "--allow-large-initial-jump after inspection."
                 )
@@ -478,7 +634,7 @@ def execute_robot_replay(
             for step in range(1, ramp_steps + 1):
                 loop_start = time.time()
                 ratio = step / ramp_steps
-                target = current_arm_q + (first_arm_target - current_arm_q) * ratio
+                target = ramp_start_q + (first_arm_target - ramp_start_q) * ratio
                 arm_ctrl.ctrl_dual_arm(target, tau)
                 sleep_to_rate(loop_start, fps=fps, speed=1.0)
 
@@ -500,6 +656,41 @@ def execute_robot_replay(
                 hand_target = hand_targets[pos]
                 if hand_target is not None:
                     hand_ctrl.ctrl_dual_hand(*hand_target)
+            if show_gui and camera_keys:
+                frame_image = build_frame_image(
+                    episode_dir=episode_dir,
+                    frame=frame,
+                    camera_keys=camera_keys,
+                    tile_width=tile_width,
+                )
+                idx = frame.get("idx", pos)
+                title = (
+                    f"EXECUTE idx={idx} frame={pos + 1}/{len(frames)} "
+                    f"fps={fps:g} speed={speed:g} source={source}"
+                )
+                cv2.putText(
+                    frame_image,
+                    title,
+                    (10, frame_image.shape[0] - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow(window_name, frame_image)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    print("Stopped by user.")
+                    return
+                if key == ord(" "):
+                    while True:
+                        pause_key = cv2.waitKey(0) & 0xFF
+                        if pause_key in (ord(" "), ord("q"), 27):
+                            break
+                    if pause_key in (ord("q"), 27):
+                        print("Stopped by user.")
+                        return
             if pos == 0 or (pos + 1) % 30 == 0 or pos == len(frames) - 1:
                 print(f"sent frame {pos + 1}/{len(frames)} idx={frame.get('idx', pos)}")
             sleep_to_rate(loop_start, fps=fps, speed=speed)
@@ -509,6 +700,8 @@ def execute_robot_replay(
         if go_home and arm_ctrl is not None:
             print("Returning arms to home...")
             arm_ctrl.ctrl_dual_arm_go_home()
+        if show_gui:
+            cv2.destroyAllWindows()
 
 
 def print_episode_summary(
@@ -649,8 +842,18 @@ def main() -> int:
                     "--execute will move the physical robot. Re-run with --yes "
                     "after confirming the workspace is clear."
                 )
+            show_gui = not args.no_gui
+            if show_gui and not has_display():
+                print("[warn] no display found; switching to --no-gui mode", file=sys.stderr)
+                show_gui = False
+            if show_gui:
+                print("keys: q or Esc to stop, Space to pause/resume")
+            initial_target_q = resolve_initial_target_q(args, episode_dir)
             execute_robot_replay(
+                episode_dir=episode_dir,
                 frames=frames,
+                camera_keys=camera_keys,
+                initial_target_q=initial_target_q,
                 fps=fps,
                 speed=args.speed,
                 source=args.source,
@@ -664,6 +867,8 @@ def main() -> int:
                 max_frame_arm_delta=args.max_frame_arm_delta,
                 allow_large_initial_jump=args.allow_large_initial_jump,
                 go_home=args.go_home,
+                tile_width=args.tile_width,
+                show_gui=show_gui,
             )
             return 0
 

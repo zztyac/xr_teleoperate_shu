@@ -4,8 +4,8 @@
   python -m teleimager.image_server --rs
   python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
-  python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-  python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
+motion : python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
+debug : python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
 
 车内初始姿态默认从 teleop/initial_target_poses.json 读取。
 如需切换姿态，可使用 --initial-target-q-name 指定配置中的姿态名。
@@ -268,7 +268,7 @@ def resolve_initial_target_q(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type = float, default = 30, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
@@ -327,22 +327,30 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
+        xr_camera_name = 'right_side_camera'
+        xr_camera_config = camera_config.get(xr_camera_name)
+        if not isinstance(xr_camera_config, dict):
+            raise RuntimeError(
+                f"VR display camera '{xr_camera_name}' is not configured. "
+                "Please enable right_side_camera in the teleimager camera config."
+            )
         right_side_camera_enabled = camera_config.get('right_side_camera', {}).get('enable_zmq', False)
         left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
         right_wrist_camera_enabled = camera_config.get('right_wrist_camera', {}).get('enable_zmq', False)
-        xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        xr_need_local_img = not (args.display_mode == 'pass-through' or xr_camera_config['enable_webrtc'])
+        logger_mp.info(f"VR display camera source: {xr_camera_name}")
 
-        # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
+        # televuer_wrapper: obtain XR pose data and transmit the right-side camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=camera_config['head_camera']['binocular'],
-                                     img_shape=camera_config['head_camera']['image_shape'],
+                                     binocular=xr_camera_config['binocular'],
+                                     img_shape=xr_camera_config['image_shape'],
                                      # maybe should decrease fps for better performance?
                                      # https://github.com/unitreerobotics/xr_teleoperate/issues/172
-                                     # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
+                                     # display_fps=xr_camera_config['fps'] ? args.frequency? 30.0?
                                      display_mode=args.display_mode,
-                                     zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                     zmq=xr_camera_config['enable_zmq'],
+                                     webrtc=xr_camera_config['enable_webrtc'],
+                                     webrtc_url=f"https://{args.img_server_ip}:{xr_camera_config['webrtc_port']}/offer",
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
@@ -472,10 +480,10 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                head_img = img_client.get_head_frame()
-                if head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+            if right_side_camera_enabled and xr_need_local_img:
+                right_side_img = img_client.get_right_side_frame()
+                if right_side_img.bgr is not None:
+                    tv_wrapper.render_to_xr(right_side_img.bgr)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
@@ -490,13 +498,13 @@ if __name__ == '__main__':
             start_time = time.time()
             # get image
             if camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
-                    head_img = img_client.get_head_frame()
-                if xr_need_local_img and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
-            if right_side_camera_enabled:
                 if args.record:
+                    head_img = img_client.get_head_frame()
+            if right_side_camera_enabled:
+                if args.record or xr_need_local_img:
                     right_side_img = img_client.get_right_side_frame()
+                if xr_need_local_img and right_side_img.bgr is not None:
+                    tv_wrapper.render_to_xr(right_side_img.bgr)
             if left_wrist_camera_enabled:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -739,6 +747,7 @@ if __name__ == '__main__':
 
             current_time = time.time()
             time_elapsed = current_time - start_time
+            # 决定控制频率
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
