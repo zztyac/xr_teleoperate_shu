@@ -5,17 +5,23 @@
   python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
   python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-  python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
-
-车内初始姿态默认从 teleop/initial_target_poses.json 读取。
-如需切换姿态，可使用 --initial-target-q-name 指定配置中的姿态名。
+  python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw
+初始姿态固定从 teleop/initial_target_poses.json 读取，使用 --task-name 对应 JSON key。
 
 运行时按键：
-  r      开始机器人跟随 XR 运动
+  r      开始机器人跟随键盘 / XR 运动
   q      停止并退出程序
-  s      开始录制当前 episode，或保存正在录制的 episode
+  enter  开始录制当前 episode，或保存正在录制的 episode
   n / p  录制前切换到下一个 / 上一个按键子任务
   1-5    录制前直接选择对应的按键子任务
+  w / s  末端沿机器人 X 轴正 / 负方向持续移动
+  a / d  末端沿机器人 Y 轴正 / 负方向持续移动
+  e / c  末端沿机器人 Z 轴正 / 负方向持续移动
+  u / o  末端绕机器人 X 轴负 / 正方向持续旋转
+  i / k  末端绕机器人 Y 轴正 / 负方向持续旋转
+  j / l  末端绕机器人 Z 轴正 / 负方向持续旋转
+  space  按一下当前键盘控制末端回到初始姿态，手/夹爪恢复张开
+  f      按一次切换当前键盘控制末端的食指/夹爪按压状态
 
 每个 episode 会把当前选择的子任务写入 data.json -> text。
 子任务顺序如下，goal 保持英文，作为训练用语言标签：
@@ -32,23 +38,24 @@
 
 推荐采集流程：
   1. 按 r 开始机器人跟随。
-  2. 按 1，再按 s 录制前窗除雾；录完后再按 s 保存。
-  3. 按 2，再按 s 录制空调温度降低；录完后再按 s 保存。
-  4. 按 3，再按 s 录制空调风速降低；录完后再按 s 保存。
-  5. 按 4，再按 s 录制长按打开后备箱；录完后再按 s 保存。
-  6. 按 5，再按 s 录制长按打开遮阳板；录完后再按 s 保存。
+  2. 按 1，再按 enter 录制前窗除雾；录完后再按 enter 保存。
+  3. 按 2，再按 enter 录制空调温度降低；录完后再按 enter 保存。
+  4. 按 3，再按 enter 录制空调风速降低；录完后再按 enter 保存。
+  5. 按 4，再按 enter 录制长按打开后备箱；录完后再按 enter 保存。
+  6. 按 5，再按 enter 录制长按打开遮阳板；录完后再按 enter 保存。
 
 注意：
   - 当前子任务会在 create_episode() 前写入 recorder.text。
-  - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
+  - 录制过程中禁止切换子任务；需要先按 enter 保存当前 episode。
   - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
 """
 
 
 import time
 import argparse
-import ast
 import json
+import numpy as np
+import pinocchio as pin
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -87,6 +94,10 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 CURRENT_BUTTON_SUBTASK_IDX = 0
+PRESSED_KEYS = set()
+PRESSED_KEYS_LOCK = threading.Lock()
+KEYBOARD_EE_ACTION_ACTIVE = False
+KEYBOARD_RETURN_HOME_ACTIVE = False
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -134,6 +145,278 @@ BUTTON_SUBTASKS = [
     },
 ]
 
+KEYBOARD_TRANSLATION_KEYS = {
+    "w": np.array([1.0, 0.0, 0.0]),
+    "s": np.array([-1.0, 0.0, 0.0]),
+    "a": np.array([0.0, 1.0, 0.0]),
+    "d": np.array([0.0, -1.0, 0.0]),
+    "e": np.array([0.0, 0.0, 1.0]),
+    "c": np.array([0.0, 0.0, -1.0]),
+}
+KEYBOARD_ROTATION_KEYS = {
+    "u": np.array([-1.0, 0.0, 0.0]),
+    "o": np.array([1.0, 0.0, 0.0]),
+    "i": np.array([0.0, 1.0, 0.0]),
+    "k": np.array([0.0, -1.0, 0.0]),
+    "j": np.array([0.0, 0.0, 1.0]),
+    "l": np.array([0.0, 0.0, -1.0]),
+}
+KEYBOARD_EE_ACTION_KEY = "f"
+KEYBOARD_RETURN_HOME_KEYS = {"space", " "}
+KEYBOARD_CONTROL_KEYS = (
+    set(KEYBOARD_TRANSLATION_KEYS)
+    | set(KEYBOARD_ROTATION_KEYS)
+    | KEYBOARD_RETURN_HOME_KEYS
+    | {KEYBOARD_EE_ACTION_KEY}
+)
+
+
+def normalize_key(key) -> str:
+    return str(key).lower()
+
+
+def remember_pressed_key(key) -> bool:
+    key = normalize_key(key)
+    if key not in KEYBOARD_CONTROL_KEYS:
+        return False
+    with PRESSED_KEYS_LOCK:
+        PRESSED_KEYS.add(key)
+    return True
+
+
+def forget_pressed_key(key) -> bool:
+    key = normalize_key(key)
+    if key not in KEYBOARD_CONTROL_KEYS:
+        return False
+    with PRESSED_KEYS_LOCK:
+        PRESSED_KEYS.discard(key)
+    return True
+
+
+def get_pressed_keys_snapshot():
+    with PRESSED_KEYS_LOCK:
+        return set(PRESSED_KEYS)
+
+
+def clear_pressed_keys():
+    global KEYBOARD_EE_ACTION_ACTIVE, KEYBOARD_RETURN_HOME_ACTIVE
+    with PRESSED_KEYS_LOCK:
+        PRESSED_KEYS.clear()
+        KEYBOARD_EE_ACTION_ACTIVE = False
+        KEYBOARD_RETURN_HOME_ACTIVE = False
+
+
+def start_keyboard_return_home():
+    global KEYBOARD_EE_ACTION_ACTIVE, KEYBOARD_RETURN_HOME_ACTIVE
+    with PRESSED_KEYS_LOCK:
+        KEYBOARD_EE_ACTION_ACTIVE = False
+        KEYBOARD_RETURN_HOME_ACTIVE = True
+        for key in KEYBOARD_RETURN_HOME_KEYS:
+            PRESSED_KEYS.discard(key)
+
+
+def is_keyboard_return_home_active():
+    with PRESSED_KEYS_LOCK:
+        return KEYBOARD_RETURN_HOME_ACTIVE
+
+
+def stop_keyboard_return_home():
+    global KEYBOARD_RETURN_HOME_ACTIVE
+    with PRESSED_KEYS_LOCK:
+        KEYBOARD_RETURN_HOME_ACTIVE = False
+
+
+def toggle_keyboard_ee_action():
+    global KEYBOARD_EE_ACTION_ACTIVE
+    with PRESSED_KEYS_LOCK:
+        if KEYBOARD_EE_ACTION_KEY in PRESSED_KEYS:
+            return KEYBOARD_EE_ACTION_ACTIVE, False
+        PRESSED_KEYS.add(KEYBOARD_EE_ACTION_KEY)
+        KEYBOARD_EE_ACTION_ACTIVE = not KEYBOARD_EE_ACTION_ACTIVE
+        return KEYBOARD_EE_ACTION_ACTIVE, True
+
+
+def is_keyboard_ee_action_active():
+    with PRESSED_KEYS_LOCK:
+        return KEYBOARD_EE_ACTION_ACTIVE
+
+
+def get_initial_end_effector_poses_from_q(arm_ik, initial_q):
+    q = np.asarray(initial_q, dtype=float).reshape(-1)
+    pin.framesForwardKinematics(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data, q)
+    pin.updateFramePlacements(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data)
+    left_pose = arm_ik.reduced_robot.data.oMf[arm_ik.L_hand_id].homogeneous.copy()
+    right_pose = arm_ik.reduced_robot.data.oMf[arm_ik.R_hand_id].homogeneous.copy()
+    return left_pose, right_pose
+
+
+def rotation_matrix_from_rotvec(rotvec):
+    angle = float(np.linalg.norm(rotvec))
+    if angle < 1e-9:
+        return np.eye(3)
+
+    axis = rotvec / angle
+    x, y, z = axis
+    skew = np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ])
+    return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+
+
+def rotvec_from_rotation_matrix(rotation):
+    trace = np.trace(rotation)
+    angle = float(np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0)))
+    if angle < 1e-9:
+        return np.zeros(3)
+
+    axis = np.array([
+        rotation[2, 1] - rotation[1, 2],
+        rotation[0, 2] - rotation[2, 0],
+        rotation[1, 0] - rotation[0, 1],
+    ])
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-9:
+        axis = np.sqrt(np.maximum((np.diag(rotation) + 1.0) * 0.5, 0.0))
+        axis[0] = np.copysign(axis[0], rotation[2, 1] - rotation[1, 2])
+        axis[1] = np.copysign(axis[1], rotation[0, 2] - rotation[2, 0])
+        axis[2] = np.copysign(axis[2], rotation[1, 0] - rotation[0, 1])
+        axis_norm = np.linalg.norm(axis)
+    if axis_norm < 1e-9:
+        return np.zeros(3)
+    return axis / axis_norm * angle
+
+
+def orthonormalize_rotation(rotation):
+    u, _, vt = np.linalg.svd(rotation)
+    result = u @ vt
+    if np.linalg.det(result) < 0.0:
+        u[:, -1] *= -1.0
+        result = u @ vt
+    return result
+
+
+class KeyboardEndEffectorController:
+    def __init__(
+        self,
+        control_arm="right",
+        linear_speed=0.025,
+        angular_speed=0.175,
+        initial_left_target=None,
+        initial_right_target=None,
+    ):
+        self.control_arm = control_arm
+        self.linear_speed = linear_speed
+        self.angular_speed = angular_speed
+        self.initial_left_target = (
+            None if initial_left_target is None else np.array(initial_left_target, dtype=float, copy=True)
+        )
+        self.initial_right_target = (
+            None if initial_right_target is None else np.array(initial_right_target, dtype=float, copy=True)
+        )
+        self.left_target = None if self.initial_left_target is None else self.initial_left_target.copy()
+        self.right_target = None if self.initial_right_target is None else self.initial_right_target.copy()
+
+    def _ensure_targets(self, left_wrist_pose, right_wrist_pose):
+        if self.left_target is None:
+            self.left_target = np.array(left_wrist_pose, dtype=float, copy=True)
+            self.initial_left_target = self.left_target.copy()
+        if self.right_target is None:
+            self.right_target = np.array(right_wrist_pose, dtype=float, copy=True)
+            self.initial_right_target = self.right_target.copy()
+
+    def _target_poses(self):
+        if self.control_arm == "left":
+            return [self.left_target]
+        if self.control_arm == "both":
+            return [self.left_target, self.right_target]
+        return [self.right_target]
+
+    def _target_initial_pose_pairs(self):
+        if self.control_arm == "left":
+            return [(self.left_target, self.initial_left_target)]
+        if self.control_arm == "both":
+            return [
+                (self.left_target, self.initial_left_target),
+                (self.right_target, self.initial_right_target),
+            ]
+        return [(self.right_target, self.initial_right_target)]
+
+    def _step_pose_toward_initial(self, pose, initial_pose, dt):
+        translation_error = initial_pose[:3, 3] - pose[:3, 3]
+        translation_norm = np.linalg.norm(translation_error)
+        translation_step = self.linear_speed * dt
+        if translation_norm <= translation_step:
+            pose[:3, 3] = initial_pose[:3, 3]
+            translation_done = True
+        elif translation_norm > 0.0:
+            pose[:3, 3] += translation_error / translation_norm * translation_step
+            translation_done = False
+        else:
+            translation_done = True
+
+        rotation_error = initial_pose[:3, :3] @ pose[:3, :3].T
+        rotation_vec = rotvec_from_rotation_matrix(rotation_error)
+        rotation_angle = np.linalg.norm(rotation_vec)
+        rotation_step = self.angular_speed * dt
+        if rotation_angle <= rotation_step:
+            pose[:3, :3] = initial_pose[:3, :3]
+            rotation_done = True
+        elif rotation_angle > 0.0:
+            step_vec = rotation_vec / rotation_angle * rotation_step
+            pose[:3, :3] = orthonormalize_rotation(
+                rotation_matrix_from_rotvec(step_vec) @ pose[:3, :3]
+            )
+            rotation_done = False
+        else:
+            rotation_done = True
+
+        return translation_done and rotation_done
+
+    def update(self, left_wrist_pose, right_wrist_pose, dt, pressed_keys, return_home_active=False):
+        self._ensure_targets(left_wrist_pose, right_wrist_pose)
+
+        if return_home_active or KEYBOARD_RETURN_HOME_KEYS & pressed_keys:
+            return_home_done = True
+            for pose, initial_pose in self._target_initial_pose_pairs():
+                return_home_done = self._step_pose_toward_initial(pose, initial_pose, dt) and return_home_done
+            return self.left_target.copy(), self.right_target.copy(), return_home_done
+
+        translation_dir = np.zeros(3)
+        for key, direction in KEYBOARD_TRANSLATION_KEYS.items():
+            if key in pressed_keys:
+                translation_dir += direction
+        translation_norm = np.linalg.norm(translation_dir)
+        if translation_norm > 1.0:
+            translation_dir /= translation_norm
+
+        rotation_dir = np.zeros(3)
+        for key, direction in KEYBOARD_ROTATION_KEYS.items():
+            if key in pressed_keys:
+                rotation_dir += direction
+        rotation_norm = np.linalg.norm(rotation_dir)
+        if rotation_norm > 1.0:
+            rotation_dir /= rotation_norm
+
+        translation_delta = translation_dir * self.linear_speed * dt
+        rotation_delta = rotation_matrix_from_rotvec(rotation_dir * self.angular_speed * dt)
+
+        if np.any(translation_delta) or rotation_norm > 0.0:
+            for pose in self._target_poses():
+                pose[:3, 3] += translation_delta
+                if rotation_norm > 0.0:
+                    pose[:3, :3] = orthonormalize_rotation(rotation_delta @ pose[:3, :3])
+
+        return self.left_target.copy(), self.right_target.copy(), False
+
+    def get_selected_button_state(self, action_active):
+        if self.control_arm == "left":
+            return action_active, False
+        if self.control_arm == "both":
+            return action_active, action_active
+        return False, action_active
+
 
 def get_current_button_subtask() -> dict:
     return BUTTON_SUBTASKS[CURRENT_BUTTON_SUBTASK_IDX]
@@ -158,12 +441,25 @@ def select_button_subtask(index: int):
 
 def on_press(key):
     global STOP, START, RECORD_TOGGLE
+    key = normalize_key(key)
+    if key in KEYBOARD_RETURN_HOME_KEYS:
+        start_keyboard_return_home()
+        logger_mp.info("Keyboard return-home started; end-effector press is OFF.")
+        return
+    if key == KEYBOARD_EE_ACTION_KEY:
+        action_active, changed = toggle_keyboard_ee_action()
+        if changed:
+            logger_mp.info(f"Keyboard end-effector press {'ON' if action_active else 'OFF'}.")
+        return
+    if remember_pressed_key(key):
+        return
     if key == 'r':
         START = True
     elif key == 'q':
         START = False
         STOP = True
-    elif key == 's' and START == True:
+        clear_pressed_keys()
+    elif key in ('enter', 'return', '\n') and START == True:
         RECORD_TOGGLE = True
     elif key == 'n':
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX + 1)
@@ -173,6 +469,11 @@ def on_press(key):
         select_button_subtask(int(key) - 1)
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+
+
+def on_release(key):
+    forget_pressed_key(key)
+
 
 def get_state() -> dict:
     """Return current heartbeat state"""
@@ -202,26 +503,19 @@ def parse_initial_target_q(raw_value, expected_dof: int):
     if raw_value is None:
         return None
 
-    if isinstance(raw_value, str):
-        try:
-            parsed = ast.literal_eval(raw_value)
-        except (SyntaxError, ValueError):
-            parsed = raw_value.split(",")
-    else:
-        parsed = raw_value
+    if not isinstance(raw_value, list):
+        raise ValueError("initial_target_q in initial_target_poses.json must be a JSON list.")
 
-    if isinstance(parsed, (int, float)):
-        values = [float(parsed)]
-    else:
-        values = [float(value) for value in parsed]
+    values = [float(value) for value in raw_value]
 
     if len(values) != expected_dof:
         raise ValueError(f"initial_target_q for this arm must have {expected_dof} values, got {len(values)}.")
     return values
 
 
-def load_named_initial_target_q(config_path: str, pose_name: str, arm: str):
-    if not pose_name or not os.path.exists(config_path):
+def load_initial_target_q_from_config(task_name: str, arm: str):
+    config_path = INITIAL_TARGET_Q_CONFIG_PATH
+    if not task_name or not os.path.exists(config_path):
         return INITIAL_TARGET_Q_MISSING
 
     try:
@@ -233,7 +527,7 @@ def load_named_initial_target_q(config_path: str, pose_name: str, arm: str):
     if not isinstance(config, dict):
         raise ValueError(f"initial target q file {config_path} must contain a JSON object.")
 
-    pose_entry = config.get(pose_name)
+    pose_entry = config.get(task_name)
     if pose_entry is None:
         return INITIAL_TARGET_Q_MISSING
     if isinstance(pose_entry, dict):
@@ -243,24 +537,16 @@ def load_named_initial_target_q(config_path: str, pose_name: str, arm: str):
 
 def resolve_initial_target_q(args):
     expected_dof = ARM_TARGET_DOF[args.arm]
-    if args.initial_target_q is not None:
-        return parse_initial_target_q(args.initial_target_q, expected_dof)
-
-    pose_name = args.initial_target_q_name
-    if pose_name is None and args.record:
-        pose_name = args.task_name
-
-    raw_value = load_named_initial_target_q(args.initial_target_q_file, pose_name, args.arm)
+    raw_value = load_initial_target_q_from_config(args.task_name, args.arm)
     if raw_value is INITIAL_TARGET_Q_MISSING:
-        if args.initial_target_q_name is not None:
-            raise ValueError(
-                f"initial target q name '{args.initial_target_q_name}' for arm '{args.arm}' "
-                f"was not found in {args.initial_target_q_file}."
-            )
-        return None
+        raise ValueError(
+            f"initial_target_q for task '{args.task_name}' and arm '{args.arm}' "
+            f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. Add it to initial_target_poses.json."
+        )
 
     logger_mp.info(
-        f"Loaded initial_target_q '{pose_name}' for {args.arm} from {args.initial_target_q_file}."
+        f"Loaded initial_target_q for task '{args.task_name}' and arm '{args.arm}' "
+        f"from {INITIAL_TARGET_Q_CONFIG_PATH}."
     )
     return parse_initial_target_q(raw_value, expected_dof)
 
@@ -268,18 +554,16 @@ def resolve_initial_target_q(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type = float, default = 30, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
-    parser.add_argument('--initial-target-q', '--initial_target_q', dest='initial_target_q', type=str, default=None,
-                        help='Initial dual-arm joint target, e.g. "[0, 0, ...]" or "0,0,...". Overrides the named JSON config.')
-    parser.add_argument('--initial-target-q-file', '--initial-target-pose-file', dest='initial_target_q_file',
-                        type=str, default=INITIAL_TARGET_Q_CONFIG_PATH,
-                        help='JSON file containing named initial dual-arm joint targets.')
-    parser.add_argument('--initial-target-q-name', '--initial-target-pose', dest='initial_target_q_name',
-                        type=str, default=None,
-                        help='Named initial target in the JSON file. Default uses --task-name when --record is enabled.')
+    parser.add_argument('--keyboard-arm', type=str, choices=['left', 'right', 'both'], default='right',
+                        help='Arm end-effector controlled by keyboard in controller input mode.')
+    parser.add_argument('--keyboard-linear-speed', type=float, default=0.025,
+                        help='Keyboard end-effector translation speed in m/s.')
+    parser.add_argument('--keyboard-angular-speed', type=float, default=0.35,
+                        help='Keyboard end-effector rotation speed in rad/s.')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
@@ -319,7 +603,7 @@ if __name__ == '__main__':
         # sshkeyboard communication mode
         else:
             listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
-                                                      kwargs={"on_press": on_press, "until": None, "sequential": False,}, 
+                                                      kwargs={"on_press": on_press, "on_release": on_release, "until": None, "sequential": False,}, 
                                                       daemon=True)
             listen_keyboard_thread.start()
 
@@ -422,6 +706,30 @@ if __name__ == '__main__':
                                            right_index_button=right_brainco_index_button)
         else:
             pass
+
+        keyboard_ee_controller = None
+        keyboard_last_update_time = time.time()
+        if args.input_mode == "controller" and not args.ipc:
+            keyboard_initial_left_pose = None
+            keyboard_initial_right_pose = None
+            try:
+                keyboard_initial_left_pose, keyboard_initial_right_pose = get_initial_end_effector_poses_from_q(
+                    arm_ik,
+                    arm_ctrl.initial_target_q,
+                )
+                logger_mp.info("Keyboard end-effector initial pose is set from initial_target_q.")
+            except Exception as e:
+                logger_mp.warning(
+                    f"Failed to get keyboard end-effector initial pose from initial_target_q: {e}. "
+                    "Falling back to the first received wrist pose."
+                )
+            keyboard_ee_controller = KeyboardEndEffectorController(
+                control_arm=args.keyboard_arm,
+                linear_speed=args.keyboard_linear_speed,
+                angular_speed=args.keyboard_angular_speed,
+                initial_left_target=keyboard_initial_left_pose,
+                initial_right_target=keyboard_initial_right_pose,
+            )
         
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:
@@ -460,8 +768,14 @@ if __name__ == '__main__':
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        if keyboard_ee_controller is not None:
+            logger_mp.info(
+                f"⌨️  Keyboard end-effector control is enabled for [{args.keyboard_arm}] arm(s): "
+                "move [w/s]=X, [a/d]=Y, [e/c]=Z; rotate [u/o]=Rx-/Rx+, [i/k]=Ry, [j/l]=Rz; "
+                "tap [space] to return home and open hand; tap [f] to toggle press."
+            )
         if args.record:
-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("🟡  Press [enter] to START or SAVE recording (toggle cycle).")
             if button_subtask_mode:
                 logger_mp.info("🟡  Press [n]/[p] to switch button subtask, or [1]-[5] to select it directly before recording.")
                 log_current_button_subtask(prefix="Initial")
@@ -479,6 +793,7 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        keyboard_last_update_time = time.time()
 
         head_img = None
         right_side_img = None
@@ -528,6 +843,14 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            pressed_keys = get_pressed_keys_snapshot()
+            left_keyboard_ee_button = False
+            right_keyboard_ee_button = False
+            if keyboard_ee_controller is not None:
+                keyboard_ee_action_active = is_keyboard_ee_action_active()
+                left_keyboard_ee_button, right_keyboard_ee_button = (
+                    keyboard_ee_controller.get_selected_button_state(keyboard_ee_action_active)
+                )
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -535,14 +858,30 @@ if __name__ == '__main__':
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
             elif args.ee == "brainco" and args.input_mode == "controller":
                 with left_brainco_index_button.get_lock():
-                    left_brainco_index_button.value = tele_data.left_ctrl_bButton
+                    left_brainco_index_button.value = (
+                        left_keyboard_ee_button
+                        if keyboard_ee_controller is not None
+                        else tele_data.left_ctrl_bButton
+                    )
                 with right_brainco_index_button.get_lock():
-                    right_brainco_index_button.value = tele_data.right_ctrl_bButton
+                    right_brainco_index_button.value = (
+                        right_keyboard_ee_button
+                        if keyboard_ee_controller is not None
+                        else tele_data.right_ctrl_bButton
+                    )
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_ctrl_triggerValue
+                    left_gripper_value.value = (
+                        (0.0 if left_keyboard_ee_button else 10.0)
+                        if keyboard_ee_controller is not None
+                        else tele_data.left_ctrl_triggerValue
+                    )
                 with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_ctrl_triggerValue
+                    right_gripper_value.value = (
+                        (0.0 if right_keyboard_ee_button else 10.0)
+                        if keyboard_ee_controller is not None
+                        else tele_data.right_ctrl_triggerValue
+                    )
             elif args.ee == "dex1" and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
@@ -552,7 +891,7 @@ if __name__ == '__main__':
                 pass
             
             # high level control
-            if args.input_mode == "controller" and args.motion:
+            if args.input_mode == "controller" and args.motion and keyboard_ee_controller is None:
                 # quit teleoperate
                 if tele_data.right_ctrl_aButton:
                     START = False
@@ -570,8 +909,24 @@ if __name__ == '__main__':
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
+            left_wrist_pose = tele_data.left_wrist_pose
+            right_wrist_pose = tele_data.right_wrist_pose
+            if keyboard_ee_controller is not None:
+                keyboard_dt = min(max(start_time - keyboard_last_update_time, 0.0), 0.1)
+                keyboard_last_update_time = start_time
+                keyboard_return_home_active = is_keyboard_return_home_active()
+                left_wrist_pose, right_wrist_pose, return_home_done = keyboard_ee_controller.update(
+                    tele_data.left_wrist_pose,
+                    tele_data.right_wrist_pose,
+                    keyboard_dt,
+                    pressed_keys,
+                    return_home_active=keyboard_return_home_active,
+                )
+                if keyboard_return_home_active and return_home_done:
+                    stop_keyboard_return_home()
+                    logger_mp.info("Keyboard return-home reached initial pose.")
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
@@ -603,9 +958,11 @@ if __name__ == '__main__':
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                        current_body_action = [0.0, 0.0, 0.0] if keyboard_ee_controller is not None else [
+                            -tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
+                            -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
+                            -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                        ]
                 elif args.ee == "brainco" and args.input_mode == "controller":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
@@ -613,9 +970,11 @@ if __name__ == '__main__':
                         left_hand_action = dual_hand_action_array[:6]
                         right_hand_action = dual_hand_action_array[-6:]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                        current_body_action = [0.0, 0.0, 0.0] if keyboard_ee_controller is not None else [
+                            -tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
+                            -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
+                            -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                        ]
                 elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
@@ -749,6 +1108,7 @@ if __name__ == '__main__':
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
+        clear_pressed_keys()
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:

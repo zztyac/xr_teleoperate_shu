@@ -4,6 +4,16 @@
 Default dataset:
     /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0001
 
+ python3 scripts/replay_episode.py --no-gui --start 0 --end 0 --print-every 1 --network-interface eth0
+  python3 scripts/replay_episode.py \
+    /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0001 \
+    --execute \
+    --yes \
+    --source actions \
+    --arm G1_29 \
+    --ee brainco \
+    --network-interface eno1
+
 Examples:
     python scripts/replay_episode.py
     python scripts/replay_episode.py --camera color_0 --camera color_2
@@ -25,7 +35,7 @@ import numpy as np
 
 
 DEFAULT_EPISODE_DIR = Path(
-    "/mnt/data/zty/json_data/vehicle_physical_button_press/episode_0001"
+    "/mnt/data/zty/json_data/vehicle_physical_button_press_ccw/episode_0022"
 )
 DEFAULT_TILE_WIDTH = 640
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -386,7 +396,12 @@ def enter_debug_mode() -> None:
     print(f"Enter debug mode: {'Success' if status == 0 else 'Failed'} {result}")
 
 
-def create_arm_controller(arm_name: str, motion: bool, sim: bool):
+def create_arm_controller(
+    arm_name: str,
+    motion: bool,
+    sim: bool,
+    initial_target_q: np.ndarray | None = None,
+):
     from teleop.robot_control.robot_arm import (
         G1_23_ArmController,
         G1_29_ArmController,
@@ -404,8 +419,12 @@ def create_arm_controller(arm_name: str, motion: bool, sim: bool):
     }
     cls = controllers[arm_name]
     if arm_name == "H1":
-        return cls(simulation_mode=sim)
-    return cls(motion_mode=motion, simulation_mode=sim)
+        return cls(simulation_mode=sim, initial_target_q=initial_target_q)
+    return cls(
+        motion_mode=motion,
+        simulation_mode=sim,
+        initial_target_q=initial_target_q,
+    )
 
 
 def sleep_to_rate(start_time: float, fps: float, speed: float) -> None:
@@ -451,18 +470,30 @@ def execute_robot_replay(
             f"--max-frame-arm-delta {max_frame_arm_delta:.3f}"
         )
 
+    first_arm_target = None
+    if use_arm:
+        first_arm_target = next(target for target in arm_targets if target is not None)
+
     print("Initializing DDS and robot controllers...")
     initialize_dds(sim=sim, network_interface=network_interface)
     if use_arm and not motion and not sim:
         enter_debug_mode()
 
-    arm_ctrl = create_arm_controller(arm_name, motion=motion, sim=sim) if use_arm else None
+    arm_ctrl = (
+        create_arm_controller(
+            arm_name,
+            motion=motion,
+            sim=sim,
+            initial_target_q=first_arm_target,
+        )
+        if use_arm
+        else None
+    )
     hand_ctrl = BraincoDirectController() if use_hand else None
-    tau = np.zeros(14, dtype=float)
+    tau = np.zeros_like(first_arm_target, dtype=float) if first_arm_target is not None else None
 
     try:
         if arm_ctrl is not None:
-            first_arm_target = next(target for target in arm_targets if target is not None)
             current_arm_q = arm_ctrl.get_current_dual_arm_q()
             initial_delta = float(np.max(np.abs(first_arm_target - current_arm_q)))
             print(f"current-to-first max arm delta: {initial_delta:.3f} rad")
