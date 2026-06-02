@@ -1,9 +1,16 @@
 """车内物理按键数据采集
 
 使用真实相机时，先启动图像服务：
+机器人端：
+  ssh unitree@192.168.123.164
+  conda activate teleimager
   python -m teleimager.image_server --rs
-  python -m teleimager.image_client --host 192.168.123.164
+
+PC 端：
+   conda activate tv
+   python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
+cd /home/ubuntu/zty/xr_teleoperate_shu
 motion : python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
 debug : python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
 
@@ -327,7 +334,7 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
-        xr_camera_name = 'right_side_camera'
+        xr_camera_name = 'head_camera'
         xr_camera_config = camera_config.get(xr_camera_name)
         if not isinstance(xr_camera_config, dict):
             raise RuntimeError(
@@ -337,6 +344,7 @@ if __name__ == '__main__':
         right_side_camera_enabled = camera_config.get('right_side_camera', {}).get('enable_zmq', False)
         left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
         right_wrist_camera_enabled = camera_config.get('right_wrist_camera', {}).get('enable_zmq', False)
+        
         xr_need_local_img = not (args.display_mode == 'pass-through' or xr_camera_config['enable_webrtc'])
         logger_mp.info(f"VR display camera source: {xr_camera_name}")
 

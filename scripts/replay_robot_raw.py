@@ -11,7 +11,7 @@ import numpy as np
 
 
 DEFAULT_EPISODE_PATH = Path(
-    "/mnt/data/zty/json_data/vehicle_physical_button_press/episode_0002"
+    "/mnt/data/zty/json_data/vehicle_physical_button_press/episode_0019"
 )
 DEFAULT_UNITREE_LEROBOT_ROOT = Path("/home/ubuntu/zty/unitree_lerobot")
 ARM_DOF = {"G1_29": 14, "G1_23": 10}
