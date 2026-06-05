@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Read the robot's current joint pose without publishing commands.
 
-python teleop/read_initial_pose.py --arm G1_29 --pretty
+python teleop/read_initial_pose.py --arm G1_29 --task-name vehicle_physical_button_press_ccw
 
 """
 
 import argparse
 import json
 import time
-from enum import IntEnum
 from typing import Iterable
 
-import numpy as np
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as go_LowState
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as hg_LowState
@@ -60,6 +58,10 @@ ARM_CONFIGS = {
 }
 
 
+DEFAULT_TASK_NAME = "vehicle_physical_button_press"
+DEFAULT_PRECISION = 6
+
+
 def read_lowstate(subscriber: ChannelSubscriber, timeout: float):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -70,20 +72,11 @@ def read_lowstate(subscriber: ChannelSubscriber, timeout: float):
     raise TimeoutError(f"Timed out waiting for {kTopicLowState} after {timeout:.1f}s")
 
 
-def read_joint_values(lowstate, joints: Iterable[IntEnum]) -> dict:
-    values = {}
-    for joint in joints:
-        motor = lowstate.motor_state[joint.value]
-        values[joint.name] = {
-            "index": int(joint.value),
-            "q": float(motor.q),
-            "dq": float(motor.dq),
-        }
-    return values
-
-
-def values_as_array(lowstate, joints: Iterable[IntEnum], attr: str) -> list[float]:
-    return [float(getattr(lowstate.motor_state[joint.value], attr)) for joint in joints]
+def values_as_array(lowstate, joints: Iterable, attr: str, precision: int | None) -> list[float]:
+    values = [float(getattr(lowstate.motor_state[joint.value], attr)) for joint in joints]
+    if precision is None:
+        return values
+    return [round(value, precision) for value in values]
 
 
 def main() -> None:
@@ -94,8 +87,16 @@ def main() -> None:
     parser.add_argument("--sim", action="store_true", help="Use DDS domain 1 for simulation. Default is domain 0.")
     parser.add_argument("--network-interface", default=None, help="DDS network interface, e.g. eth0.")
     parser.add_argument("--timeout", type=float, default=5.0, help="Seconds to wait for one lowstate message.")
-    parser.add_argument("--all", action="store_true", help="Also print all named body joints.")
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    parser.add_argument("--all", action="store_true", help="Kept for compatibility; all body joints are printed by default.")
+    parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Task key to print for initial_target_poses.json.")
+    parser.add_argument(
+        "--precision",
+        type=int,
+        default=DEFAULT_PRECISION,
+        help="Decimal places for q values. Use a negative value to keep raw floats.",
+    )
+    parser.add_argument("--compact", action="store_true", help="Print compact JSON instead of indented JSON.")
+    parser.add_argument("--pretty", action="store_true", help="Kept for compatibility; JSON is indented by default.")
     args = parser.parse_args()
 
     cfg = ARM_CONFIGS[args.arm]
@@ -106,27 +107,20 @@ def main() -> None:
     subscriber.Init()
     lowstate = read_lowstate(subscriber, args.timeout)
 
+    all_joints = list(cfg["all_joints"])
     arm_joints = list(cfg["arm_joints"])
+    precision = None if args.precision < 0 else args.precision
     result = {
-        "arm": args.arm,
-        "topic": kTopicLowState,
-        "domain_id": domain_id,
-        "timestamp_unix": time.time(),
-        "dual_arm_q": values_as_array(lowstate, arm_joints, "q"),
-        "dual_arm_dq": values_as_array(lowstate, arm_joints, "dq"),
-        "dual_arm_named": read_joint_values(lowstate, arm_joints),
+        args.task_name: {
+            args.arm: {
+                "all_joint_q": values_as_array(lowstate, all_joints, "q", precision),
+                "dual_arm_q": values_as_array(lowstate, arm_joints, "q", precision),
+            }
+        }
     }
 
-    if args.all:
-        result["all_named"] = read_joint_values(lowstate, cfg["all_joints"])
-
-    indent = 2 if args.pretty else None
+    indent = None if args.compact else 2
     print(json.dumps(result, indent=indent, ensure_ascii=False))
-
-    if args.pretty:
-        q = np.array(result["dual_arm_q"])
-        print("\n# Python literal for current dual-arm q:")
-        print(np.array2string(q, precision=6, separator=", "))
 
 
 if __name__ == "__main__":

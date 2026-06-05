@@ -23,7 +23,23 @@ G1_23_Num_Motors = 35
 H1_2_Num_Motors = 35
 H1_Num_Motors = 20
 H2_Num_Motors = 35
- 
+G1_29_Valid_Motors = 29
+G1_Mode_PR = 0
+G1_29_LowLevel_Kp = [
+    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
+    60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
+    60.0, 40.0, 40.0,
+    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+    40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0,
+]
+G1_29_LowLevel_Kd = [
+    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 2.0, 1.0, 1.0,
+    1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+]
+
 
 class MotorState:
     def __init__(self):
@@ -33,6 +49,7 @@ class MotorState:
 class G1_29_LowState:
     def __init__(self):
         self.motor_state = [MotorState() for _ in range(G1_29_Num_Motors)]
+        self.mode_machine = 0
 
 class G1_23_LowState:
     def __init__(self):
@@ -74,13 +91,43 @@ def _resolve_initial_target_q(initial_target_q, dof: int, controller_name: str):
     return target_q.copy()
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None):
+    def __init__(
+        self,
+        motion_mode = False,
+        simulation_mode = False,
+        initial_target_q = None,
+        initial_full_body_q = None,
+        control_full_body = False,
+        body_velocity_limit = 0.5,
+        body_ramp_duration = 6.0,
+    ):
         logger_mp.info("Initialize G1_29_ArmController...")
-        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "G1_29_ArmController")
-        self.q_target = self.initial_target_q.copy()
-        self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        self.control_full_body = bool(control_full_body)
+        if self.control_full_body and self.motion_mode:
+            raise ValueError("[G1_29_ArmController] control_full_body is only supported in debug mode.")
+        if self.control_full_body and initial_full_body_q is None:
+            raise ValueError("[G1_29_ArmController] control_full_body requires initial_full_body_q.")
+        self.body_velocity_limit = float(body_velocity_limit)
+        if self.body_velocity_limit <= 0:
+            raise ValueError("[G1_29_ArmController] body_velocity_limit must be greater than 0.")
+        self.body_ramp_duration = float(body_ramp_duration)
+        if self.body_ramp_duration < 0:
+            raise ValueError("[G1_29_ArmController] body_ramp_duration must be greater than or equal to 0.")
+
+        self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "G1_29_ArmController")
+        self.initial_full_body_q = (
+            _resolve_initial_target_q(initial_full_body_q, len(G1_29_JointIndex), "G1_29_ArmController initial_full_body_q")
+            if self.control_full_body
+            else None
+        )
+        self.q_target = self.initial_target_q.copy()
+        self.tauff_target = np.zeros(14)
+        self.body_q_target = None
+        self.full_body_q_target = None
+        self.full_body_start_q = None
+        self.full_body_ramp_start_time = None
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -118,18 +165,41 @@ class G1_29_ArmController:
         # initialize hg's lowcmd msg
         self.crc = CRC()
         self.msg = unitree_hg_msg_dds__LowCmd_()
-        self.msg.mode_pr = 0
+        self.msg.mode_pr = G1_Mode_PR
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
-        logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
+        self.body_control_indices = [
+            id for id in G1_29_JointIndex
+            if id.value not in arm_indices and id.value < G1_29_Valid_Motors
+        ]
+        self.full_body_control_indices = [
+            id for id in G1_29_JointIndex
+            if id.value < G1_29_Valid_Motors
+        ]
+        if self.control_full_body:
+            self.body_q_target = np.array(
+                [self.initial_full_body_q[id] for id in self.body_control_indices],
+                dtype=float,
+            )
+            self.full_body_q_target = self.initial_full_body_q[:G1_29_Valid_Motors].copy()
+            self.full_body_start_q = self.get_current_valid_motor_q().copy()
+            self.full_body_ramp_start_time = time.time()
+            logger_mp.info("Control G1_29 valid joints 0..28 in debug mode; arms may be updated by IK.")
+            logger_mp.info(f"Ramp G1_29 leg and waist joints to all_joint_q over {self.body_ramp_duration:.2f}s.")
+        else:
+            logger_mp.info("Lock all joints except two arms...")
+
         for id in G1_29_JointIndex:
             self.msg.motor_cmd[id].mode = 1
-            if id.value in arm_indices:
+            if self.control_full_body and id.value < G1_29_Valid_Motors:
+                self.msg.motor_cmd[id].kp = G1_29_LowLevel_Kp[id.value]
+                self.msg.motor_cmd[id].kd = G1_29_LowLevel_Kd[id.value]
+            elif id.value in arm_indices:
                 if self._Is_wrist_motor(id):
                     self.msg.motor_cmd[id].kp = self.kp_wrist
                     self.msg.motor_cmd[id].kd = self.kd_wrist
@@ -159,18 +229,73 @@ class G1_29_ArmController:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = G1_29_LowState()
+                lowstate.mode_machine = msg.mode_machine
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
+    def clip_q_target(self, current_q, target_q, velocity_limit):
+        current_q = np.asarray(current_q, dtype=float)
+        target_q = np.asarray(target_q, dtype=float)
+        delta = target_q - current_q
+        if delta.size == 0:
+            return target_q
+        max_delta = np.max(np.abs(delta))
+        if max_delta <= 0:
+            return target_q
+        motion_scale = max_delta / (velocity_limit * self.control_dt)
+        return current_q + delta / max(motion_scale, 1.0)
+
     def clip_arm_q_target(self, target_q, velocity_limit):
         current_q = self.get_current_dual_arm_q()
-        delta = target_q - current_q
-        motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
-        return cliped_arm_q_target
+        return self.clip_q_target(current_q, target_q, velocity_limit)
+
+    def clip_body_q_target(self, target_q, velocity_limit):
+        current_q = self.get_current_body_q()
+        return self.clip_q_target(current_q, target_q, velocity_limit)
+
+    def clip_full_body_q_target(self, target_q):
+        current_q = self.get_current_valid_motor_q()
+        clipped_q = current_q.copy()
+        body_indices = [id.value for id in self.body_control_indices]
+        arm_indices = [id.value for id in G1_29_JointArmIndex]
+        clipped_q[body_indices] = self.clip_q_target(
+            current_q[body_indices],
+            target_q[body_indices],
+            self.body_velocity_limit,
+        )
+        clipped_q[arm_indices] = self.clip_q_target(
+            current_q[arm_indices],
+            target_q[arm_indices],
+            self.arm_velocity_limit,
+        )
+        return clipped_q
+
+    def ramp_full_body_q_target(self, target_q, now):
+        current_q = self.get_current_valid_motor_q()
+        commanded_q = np.asarray(target_q, dtype=float).copy()
+
+        body_indices = [id.value for id in self.body_control_indices]
+        arm_indices = [id.value for id in G1_29_JointArmIndex]
+
+        if self.full_body_start_q is not None:
+            if self.body_ramp_duration <= 0:
+                ratio = 1.0
+            else:
+                ratio = min(1.0, max(0.0, (now - self.full_body_ramp_start_time) / self.body_ramp_duration))
+            commanded_q[body_indices] = (
+                self.full_body_start_q[body_indices]
+                + (commanded_q[body_indices] - self.full_body_start_q[body_indices]) * ratio
+            )
+
+        commanded_q[arm_indices] = self.clip_q_target(
+            current_q[arm_indices],
+            target_q[arm_indices],
+            self.arm_velocity_limit,
+        )
+        return commanded_q
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
@@ -178,20 +303,39 @@ class G1_29_ArmController:
 
         while True:
             start_time = time.time()
+            if not self.motion_mode:
+                self.msg.mode_pr = G1_Mode_PR
+                self.msg.mode_machine = self.get_mode_machine()
 
             with self.ctrl_lock:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
+                full_body_q_target = self.full_body_q_target.copy() if self.control_full_body else None
 
-            if self.simulation_mode:
-                cliped_arm_q_target = arm_q_target
+            if self.control_full_body:
+                if self.simulation_mode:
+                    clipped_full_body_q_target = full_body_q_target
+                else:
+                    clipped_full_body_q_target = self.ramp_full_body_q_target(full_body_q_target, start_time)
+
+                arm_tauff_by_id = {
+                    id.value: arm_tauff_target[idx]
+                    for idx, id in enumerate(G1_29_JointArmIndex)
+                }
+                for id in self.full_body_control_indices:
+                    self.msg.motor_cmd[id].q = clipped_full_body_q_target[id.value]
+                    self.msg.motor_cmd[id].dq = 0
+                    self.msg.motor_cmd[id].tau = arm_tauff_by_id.get(id.value, 0)
             else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                if self.simulation_mode:
+                    cliped_arm_q_target = arm_q_target
+                else:
+                    cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
-            for idx, id in enumerate(G1_29_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                for idx, id in enumerate(G1_29_JointArmIndex):
+                    self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                    self.msg.motor_cmd[id].dq = 0
+                    self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
@@ -212,18 +356,29 @@ class G1_29_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+            if self.control_full_body:
+                for idx, id in enumerate(G1_29_JointArmIndex):
+                    self.full_body_q_target[id.value] = q_target[idx]
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        return self.lowstate_subscriber.Read().mode_machine
+        return self.lowstate_buffer.GetData().mode_machine
     
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointIndex])
+
+    def get_current_valid_motor_q(self):
+        '''Return current state q of valid G1_29 motors 0..28.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in self.full_body_control_indices])
     
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointArmIndex])
+
+    def get_current_body_q(self):
+        '''Return current state q of the non-arm controlled body motors.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in self.body_control_indices])
     
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
@@ -236,6 +391,9 @@ class G1_29_ArmController:
         current_attempts = 0
         with self.ctrl_lock:
             self.q_target = self.initial_target_q.copy()
+            if self.control_full_body:
+                for idx, id in enumerate(G1_29_JointArmIndex):
+                    self.full_body_q_target[id.value] = self.initial_target_q[idx]
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:

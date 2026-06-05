@@ -1,11 +1,21 @@
 """车内物理按键数据采集
+# UNITREE：
+1. 启动灵巧手
+sudo ~/brainco_hand_service/bin/brainco_hand_server
+2. 启动相机server:
+conda activate teleimager
+python -m teleimager.image_server --rs
 
-使用真实相机时，先启动图像服务：
-  python -m teleimager.image_server --rs
-  python -m teleimager.image_client --host 192.168.123.164
-启动遥操作和数据录制：
-  python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-  python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw
+# PC 端：
+conda activate tv
+cd /home/ubuntu/zty/xr_teleoperate_shu
+1. 验证摄像头正常连接：python -m teleimager.image_client --host 192.168.123.164
+2. 启动遥操作和数据录制：
+  运控模式： python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
+  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw
+  debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw --debug-arms-only
+
+
 初始姿态固定从 teleop/initial_target_poses.json 读取，使用 --task-name 对应 JSON key。
 
 运行时按键：
@@ -71,7 +81,23 @@ INITIAL_TARGET_Q_CONFIG_PATH = os.path.join(current_dir, "initial_target_poses.j
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController
+from teleop.robot_control.robot_arm import (
+    G1_29_ArmController,
+    G1_23_ArmController,
+    H1_2_ArmController,
+    H1_ArmController,
+    H2_ArmController,
+    G1_29_JointArmIndex,
+    G1_29_JointIndex,
+    G1_23_JointArmIndex,
+    G1_23_JointIndex,
+    H1_2_JointArmIndex,
+    H1_2_JointIndex,
+    H1_JointArmIndex,
+    H1_JointIndex,
+    H2_JointArmIndex,
+    H2_JointIndex,
+)
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -241,13 +267,21 @@ def is_keyboard_ee_action_active():
         return KEYBOARD_EE_ACTION_ACTIVE
 
 
-def get_initial_end_effector_poses_from_q(arm_ik, initial_q):
-    q = np.asarray(initial_q, dtype=float).reshape(-1)
+def pose_matrix_to_list(pose):
+    return np.asarray(pose, dtype=float).reshape(4, 4).tolist()
+
+
+def get_end_effector_poses_from_q(arm_ik, q):
+    q = np.asarray(q, dtype=float).reshape(-1)
     pin.framesForwardKinematics(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data, q)
     pin.updateFramePlacements(arm_ik.reduced_robot.model, arm_ik.reduced_robot.data)
     left_pose = arm_ik.reduced_robot.data.oMf[arm_ik.L_hand_id].homogeneous.copy()
     right_pose = arm_ik.reduced_robot.data.oMf[arm_ik.R_hand_id].homogeneous.copy()
     return left_pose, right_pose
+
+
+def get_initial_end_effector_poses_from_q(arm_ik, initial_q):
+    return get_end_effector_poses_from_q(arm_ik, initial_q)
 
 
 def rotation_matrix_from_rotvec(rotvec):
@@ -496,21 +530,93 @@ ARM_TARGET_DOF = {
     "H1": 8,
     "H2": 14,
 }
+ARM_FULL_BODY_DOF = {
+    "G1_29": len(G1_29_JointIndex),
+    "G1_23": len(G1_23_JointIndex),
+    "H1_2": len(H1_2_JointIndex),
+    "H1": len(H1_JointIndex),
+    "H2": len(H2_JointIndex),
+}
+ARM_JOINT_INDICES = {
+    "G1_29": [joint.value for joint in G1_29_JointArmIndex],
+    "G1_23": [joint.value for joint in G1_23_JointArmIndex],
+    "H1_2": [joint.value for joint in H1_2_JointArmIndex],
+    "H1": [joint.value for joint in H1_JointArmIndex],
+    "H2": [joint.value for joint in H2_JointArmIndex],
+}
+ALL_JOINT_Q_FIELD = "all_joint_q"
+DUAL_ARM_Q_FIELD = "dual_arm_q"
+LEGACY_INITIAL_TARGET_Q_FIELD = "initial_target_q"
+INITIAL_TARGET_Q_FIELDS = {
+    ALL_JOINT_Q_FIELD,
+    DUAL_ARM_Q_FIELD,
+    LEGACY_INITIAL_TARGET_Q_FIELD,
+}
 INITIAL_TARGET_Q_MISSING = object()
 
 
-def parse_initial_target_q(raw_value, expected_dof: int):
+def parse_joint_q(raw_value, expected_dof: int, field_name: str):
     if raw_value is None:
         return None
 
     if not isinstance(raw_value, list):
-        raise ValueError("initial_target_q in initial_target_poses.json must be a JSON list.")
+        raise ValueError(f"{field_name} in initial_target_poses.json must be a JSON list.")
 
     values = [float(value) for value in raw_value]
 
     if len(values) != expected_dof:
-        raise ValueError(f"initial_target_q for this arm must have {expected_dof} values, got {len(values)}.")
+        raise ValueError(f"{field_name} must have {expected_dof} values, got {len(values)}.")
     return values
+
+
+def parse_initial_target_q(raw_value, expected_dof: int):
+    return parse_joint_q(raw_value, expected_dof, LEGACY_INITIAL_TARGET_Q_FIELD)
+
+
+def extract_dual_arm_q_from_all_joint_q(raw_value, arm: str):
+    all_joint_q = parse_joint_q(raw_value, ARM_FULL_BODY_DOF[arm], ALL_JOINT_Q_FIELD)
+    return [all_joint_q[index] for index in ARM_JOINT_INDICES[arm]]
+
+
+def parse_full_body_q_entry(raw_value, arm: str):
+    full_body_dof = ARM_FULL_BODY_DOF[arm]
+
+    if isinstance(raw_value, dict):
+        if ALL_JOINT_Q_FIELD in raw_value:
+            return parse_joint_q(raw_value[ALL_JOINT_Q_FIELD], full_body_dof, ALL_JOINT_Q_FIELD), ALL_JOINT_Q_FIELD
+        if LEGACY_INITIAL_TARGET_Q_FIELD in raw_value:
+            legacy_value = raw_value[LEGACY_INITIAL_TARGET_Q_FIELD]
+            if isinstance(legacy_value, list) and len(legacy_value) == full_body_dof:
+                return parse_joint_q(legacy_value, full_body_dof, LEGACY_INITIAL_TARGET_Q_FIELD), LEGACY_INITIAL_TARGET_Q_FIELD
+        return None, None
+
+    if isinstance(raw_value, list) and len(raw_value) == full_body_dof:
+        return parse_joint_q(raw_value, full_body_dof, "legacy_full_body_list"), "legacy_full_body_list"
+    return None, None
+
+
+def parse_initial_target_pose_entry(raw_value, arm: str):
+    expected_dof = ARM_TARGET_DOF[arm]
+    full_body_dof = ARM_FULL_BODY_DOF[arm]
+
+    if isinstance(raw_value, dict):
+        if ALL_JOINT_Q_FIELD in raw_value:
+            return extract_dual_arm_q_from_all_joint_q(raw_value[ALL_JOINT_Q_FIELD], arm), ALL_JOINT_Q_FIELD
+        if DUAL_ARM_Q_FIELD in raw_value:
+            return parse_joint_q(raw_value[DUAL_ARM_Q_FIELD], expected_dof, DUAL_ARM_Q_FIELD), DUAL_ARM_Q_FIELD
+        if LEGACY_INITIAL_TARGET_Q_FIELD in raw_value:
+            legacy_value = raw_value[LEGACY_INITIAL_TARGET_Q_FIELD]
+            if isinstance(legacy_value, list) and len(legacy_value) == full_body_dof:
+                return extract_dual_arm_q_from_all_joint_q(legacy_value, arm), LEGACY_INITIAL_TARGET_Q_FIELD
+            return parse_initial_target_q(legacy_value, expected_dof), LEGACY_INITIAL_TARGET_Q_FIELD
+        raise ValueError(
+            f"initial target pose entry for arm '{arm}' must contain "
+            f"'{ALL_JOINT_Q_FIELD}' or '{DUAL_ARM_Q_FIELD}'."
+        )
+
+    if isinstance(raw_value, list) and len(raw_value) == full_body_dof:
+        return extract_dual_arm_q_from_all_joint_q(raw_value, arm), "legacy_full_body_list"
+    return parse_initial_target_q(raw_value, expected_dof), "legacy_dual_arm_list"
 
 
 def load_initial_target_q_from_config(task_name: str, arm: str):
@@ -531,24 +637,52 @@ def load_initial_target_q_from_config(task_name: str, arm: str):
     if pose_entry is None:
         return INITIAL_TARGET_Q_MISSING
     if isinstance(pose_entry, dict):
-        return pose_entry.get(arm, INITIAL_TARGET_Q_MISSING)
+        if arm in pose_entry:
+            return pose_entry[arm]
+        if INITIAL_TARGET_Q_FIELDS & set(pose_entry):
+            return pose_entry
+        return INITIAL_TARGET_Q_MISSING
     return pose_entry
 
 
 def resolve_initial_target_q(args):
-    expected_dof = ARM_TARGET_DOF[args.arm]
     raw_value = load_initial_target_q_from_config(args.task_name, args.arm)
     if raw_value is INITIAL_TARGET_Q_MISSING:
         raise ValueError(
             f"initial_target_q for task '{args.task_name}' and arm '{args.arm}' "
-            f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. Add it to initial_target_poses.json."
+            f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. "
+            f"Add '{ALL_JOINT_Q_FIELD}' to initial_target_poses.json."
+        )
+
+    initial_target_q, source_field = parse_initial_target_pose_entry(raw_value, args.arm)
+    logger_mp.info(
+        f"Loaded {source_field} for task '{args.task_name}' and arm '{args.arm}' "
+        f"from {INITIAL_TARGET_Q_CONFIG_PATH}; using {len(initial_target_q)} dual-arm joints for control."
+    )
+    return initial_target_q
+
+
+def resolve_initial_full_body_q(args):
+    raw_value = load_initial_target_q_from_config(args.task_name, args.arm)
+    if raw_value is INITIAL_TARGET_Q_MISSING:
+        raise ValueError(
+            f"initial full-body q for task '{args.task_name}' and arm '{args.arm}' "
+            f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. "
+            f"Add '{ALL_JOINT_Q_FIELD}' to initial_target_poses.json."
+        )
+
+    initial_full_body_q, source_field = parse_full_body_q_entry(raw_value, args.arm)
+    if initial_full_body_q is None:
+        raise ValueError(
+            f"--debug-full-body requires '{ALL_JOINT_Q_FIELD}' with "
+            f"{ARM_FULL_BODY_DOF[args.arm]} values for task '{args.task_name}' and arm '{args.arm}'."
         )
 
     logger_mp.info(
-        f"Loaded initial_target_q for task '{args.task_name}' and arm '{args.arm}' "
-        f"from {INITIAL_TARGET_Q_CONFIG_PATH}."
+        f"Loaded {source_field} for task '{args.task_name}' and arm '{args.arm}' "
+        f"from {INITIAL_TARGET_Q_CONFIG_PATH}; using {len(initial_full_body_q)} full-body joints in debug mode."
     )
-    return parse_initial_target_q(raw_value, expected_dof)
+    return initial_full_body_q
 
 
 if __name__ == '__main__':
@@ -569,6 +703,14 @@ if __name__ == '__main__':
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
+    parser.add_argument('--debug-full-body', action='store_true',
+                        help='In debug mode, explicitly control G1_29 legs and waist from all_joint_q while arms remain IK-controlled.')
+    parser.add_argument('--debug-arms-only', action='store_true',
+                        help='In debug mode, keep the old behavior and control only arms.')
+    parser.add_argument('--debug-full-body-velocity-limit', type=float, default=0.5,
+                        help='Legacy velocity limit in rad/s for debug full-body non-arm joints.')
+    parser.add_argument('--debug-full-body-ramp-duration', type=float, default=6.0,
+                        help='Seconds used to ramp G1_29 leg and waist joints to all_joint_q in debug full-body mode.')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
@@ -582,8 +724,32 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.debug_full_body and args.debug_arms_only:
+        parser.error("--debug-full-body and --debug-arms-only cannot be used together.")
+    if args.debug_full_body and args.motion:
+        parser.error("--debug-full-body can only be used in debug mode. Remove --motion.")
+    if args.debug_full_body and args.arm != "G1_29":
+        parser.error("--debug-full-body is currently implemented only for --arm G1_29.")
+    if args.debug_full_body_velocity_limit <= 0:
+        parser.error("--debug-full-body-velocity-limit must be greater than 0.")
+    if args.debug_full_body_ramp_duration < 0:
+        parser.error("--debug-full-body-ramp-duration must be greater than or equal to 0.")
+
     try:
         initial_target_q = resolve_initial_target_q(args)
+        control_debug_full_body = False
+        initial_full_body_q = None
+        auto_debug_full_body = (not args.motion and args.arm == "G1_29" and not args.debug_arms_only)
+        if args.debug_full_body or auto_debug_full_body:
+            try:
+                initial_full_body_q = resolve_initial_full_body_q(args)
+                control_debug_full_body = True
+            except ValueError:
+                if args.debug_full_body:
+                    raise
+                logger_mp.warning(
+                    "Debug full-body control is not enabled because this task has no 35-value all_joint_q."
+                )
     except ValueError as e:
         parser.error(str(e))
     button_subtask_mode = args.record and args.task_name == 'vehicle_physical_button_press'
@@ -637,11 +803,25 @@ if __name__ == '__main__':
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            debug_mode_name = result.get('name') if isinstance(result, dict) else None
+            if control_debug_full_body and (status != 0 or result is None or debug_mode_name):
+                raise RuntimeError(
+                    "Failed to enter Unitree debug mode. Full-body low-level control cannot drive legs "
+                    "while a high-level motion mode is still active."
+                )
 
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
+            arm_ctrl = G1_29_ArmController(
+                motion_mode=args.motion,
+                simulation_mode=args.sim,
+                initial_target_q=initial_target_q,
+                initial_full_body_q=initial_full_body_q,
+                control_full_body=control_debug_full_body,
+                body_velocity_limit=args.debug_full_body_velocity_limit,
+                body_ramp_duration=args.debug_full_body_ramp_duration,
+            )
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
@@ -996,6 +1176,14 @@ if __name__ == '__main__':
                 right_arm_state = current_lr_arm_q[-7:]
                 left_arm_action = sol_q[:7]
                 right_arm_action = sol_q[-7:]
+                current_left_wrist_pose, current_right_wrist_pose = get_end_effector_poses_from_q(
+                    arm_ik,
+                    current_lr_arm_q,
+                )
+                left_arm_ee_state_pose = pose_matrix_to_list(current_left_wrist_pose)
+                right_arm_ee_state_pose = pose_matrix_to_list(current_right_wrist_pose)
+                left_arm_ee_action_pose = pose_matrix_to_list(left_wrist_pose)
+                right_arm_ee_action_pose = pose_matrix_to_list(right_wrist_pose)
                 if RECORD_RUNNING:
                     colors = {}
                     depths = {}
@@ -1050,7 +1238,13 @@ if __name__ == '__main__':
                             "qpos":   right_arm_state.tolist(),       
                             "qvel":   [],                          
                             "torque": [],                         
-                        },                        
+                        },
+                        "left_arm_ee_pose": {
+                            "pose": left_arm_ee_state_pose,
+                        },
+                        "right_arm_ee_pose": {
+                            "pose": right_arm_ee_state_pose,
+                        },
                         "left_ee": {                                                                    
                             "qpos":   left_ee_state,           
                             "qvel":   [],                           
@@ -1075,7 +1269,13 @@ if __name__ == '__main__':
                             "qpos":   right_arm_action.tolist(),       
                             "qvel":   [],       
                             "torque": [],       
-                        },                         
+                        },
+                        "left_arm_ee_pose": {
+                            "pose": left_arm_ee_action_pose,
+                        },
+                        "right_arm_ee_pose": {
+                            "pose": right_arm_ee_action_pose,
+                        },
                         "left_ee": {                                   
                             "qpos":   left_hand_action,       
                             "qvel":   [],       
