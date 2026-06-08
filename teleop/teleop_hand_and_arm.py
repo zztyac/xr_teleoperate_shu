@@ -12,7 +12,7 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
 1. 验证摄像头正常连接：python -m teleimager.image_client --host 192.168.123.164
 2. 启动遥操作和数据录制：
   运控模式： python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw
+  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw --headless
   debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw --debug-arms-only
 
 
