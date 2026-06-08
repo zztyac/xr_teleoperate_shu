@@ -1,0 +1,78 @@
+{
+  "vehicle_physical_button_press": [
+    {
+      "id": "front_windshield_defrost",
+      "goal": "Press the front windshield defrost button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: front windshield defrost.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "ac_temperature_down_driver",
+      "goal": "Press the driver air conditioning temperature down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: driver air conditioning temperature down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "fan_speed_down",
+      "goal": "Press the fan speed down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: fan speed down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "ac_temperature_down_passenger",
+      "goal": "Press the passenger air conditioning temperature down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: passenger air conditioning temperature down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "trunk_open_long_press",
+      "goal": "Long-press the trunk open button until the trunk starts opening.",
+      "desc": "Collect a demonstration for the in-car physical button task: trunk open by long press.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press and hold the button; step4: keep holding until the target function starts; step5: release the button; step6: return to a safe pose;"
+    },
+    {
+      "id": "sunshade_open_long_press",
+      "goal": "Long-press the sunshade open button until the sunshade starts opening.",
+      "desc": "Collect a demonstration for the in-car physical button task: sunshade open by long press.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press and hold the button; step4: keep holding until the target function starts; step5: release the button; step6: return to a safe pose;"
+    }
+  ],
+  "vehicle_physical_button_press_ccw": [
+    {
+      "id": "front_windshield_defrost",
+      "goal": "Press the front windshield defrost button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: front windshield defrost.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "ac_temperature_down_driver",
+      "goal": "Press the driver air conditioning temperature down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: driver air conditioning temperature down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "fan_speed_down",
+      "goal": "Press the fan speed down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: fan speed down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "ac_temperature_down_passenger",
+      "goal": "Press the passenger air conditioning temperature down button once.",
+      "desc": "Collect a demonstration for the in-car physical button task: passenger air conditioning temperature down.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button once; step4: release the button; step5: return to a safe pose;"
+    },
+    {
+      "id": "trunk_open_long_press",
+      "goal": "Long-press the trunk open button until the trunk starts opening.",
+      "desc": "Collect a demonstration for the in-car physical button task: trunk open by long press.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press and hold the button; step4: keep holding until the target function starts; step5: release the button; step6: return to a safe pose;"
+    },
+    {
+      "id": "sunshade_open_long_press",
+      "goal": "Long-press the sunshade open button until the sunshade starts opening.",
+      "desc": "Collect a demonstration for the in-car physical button task: sunshade open by long press.",
+      "steps": "step1: move the dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press and hold the button; step4: keep holding until the target function starts; step5: release the button; step6: return to a safe pose;"
+    }
+  ]
+}
