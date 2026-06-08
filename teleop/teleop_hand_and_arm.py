@@ -23,7 +23,7 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
   q      停止并退出程序
   enter  开始录制当前 episode，或保存正在录制的 episode
   n / p  录制前切换到下一个 / 上一个按键子任务
-  1-5    录制前直接选择对应的按键子任务
+  1-6    录制前直接选择对应的按键子任务
   w / s  末端沿机器人 X 轴正 / 负方向持续移动
   a / d  末端沿机器人 Y 轴正 / 负方向持续移动
   e / c  末端沿机器人 Z 轴正 / 负方向持续移动
@@ -37,22 +37,25 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
 子任务顺序如下，goal 保持英文，作为训练用语言标签：
   1. front_windshield_defrost
      goal: Press the front windshield defrost button once.
-  2. ac_temperature_down
-     goal: Press the air conditioning temperature down button once.
+  2. ac_temperature_down_driver
+     goal: Press the driver air conditioning temperature down button once.
   3. fan_speed_down
      goal: Press the fan speed down button once.
-  4. trunk_open_long_press
+  4. ac_temperature_down_passenger
+     goal: Press the passenger air conditioning temperature down button once.
+  5. trunk_open_long_press
      goal: Long-press the trunk open button until the trunk starts opening.
-  5. sunshade_open_long_press
+  6. sunshade_open_long_press
      goal: Long-press the sunshade open button until the sunshade starts opening.
 
 推荐采集流程：
   1. 按 r 开始机器人跟随。
   2. 按 1，再按 enter 录制前窗除雾；录完后再按 enter 保存。
-  3. 按 2，再按 enter 录制空调温度降低；录完后再按 enter 保存。
+  3. 按 2，再按 enter 录制主驾驶空调温度降低；录完后再按 enter 保存。
   4. 按 3，再按 enter 录制空调风速降低；录完后再按 enter 保存。
-  5. 按 4，再按 enter 录制长按打开后备箱；录完后再按 enter 保存。
-  6. 按 5，再按 enter 录制长按打开遮阳板；录完后再按 enter 保存。
+  5. 按 4，再按 enter 录制副驾驶空调温度降低；录完后再按 enter 保存。
+  6. 按 5，再按 enter 录制长按打开后备箱；录完后再按 enter 保存。
+  7. 按 6，再按 enter 录制长按打开遮阳板；录完后再按 enter 保存。
 
 注意：
   - 当前子任务会在 create_episode() 前写入 recorder.text。
@@ -146,15 +149,21 @@ BUTTON_SUBTASKS = [
         "steps": SHORT_PRESS_STEPS,
     },
     {
-        "id": "ac_temperature_down",
-        "goal": "Press the air conditioning temperature down button once.",
-        "desc": "Collect a demonstration for the in-car physical button task: air conditioning temperature down.",
+        "id": "ac_temperature_down_driver",
+        "goal": "Press the driver air conditioning temperature down button once.",
+        "desc": "Collect a demonstration for the in-car physical button task: driver air conditioning temperature down.",
         "steps": SHORT_PRESS_STEPS,
     },
     {
         "id": "fan_speed_down",
         "goal": "Press the fan speed down button once.",
         "desc": "Collect a demonstration for the in-car physical button task: fan speed down.",
+        "steps": SHORT_PRESS_STEPS,
+    },
+    {
+        "id": "ac_temperature_down_passenger",
+        "goal": "Press the passenger air conditioning temperature down button once.",
+        "desc": "Collect a demonstration for the in-car physical button task: passenger air conditioning temperature down.",
         "steps": SHORT_PRESS_STEPS,
     },
     {
@@ -499,7 +508,7 @@ def on_press(key):
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX + 1)
     elif key == 'p':
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX - 1)
-    elif key in ('1', '2', '3', '4', '5'):
+    elif key in ('1', '2', '3', '4', '5', '6'):
         select_button_subtask(int(key) - 1)
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
@@ -957,7 +966,7 @@ if __name__ == '__main__':
         if args.record:
             logger_mp.info("🟡  Press [enter] to START or SAVE recording (toggle cycle).")
             if button_subtask_mode:
-                logger_mp.info("🟡  Press [n]/[p] to switch button subtask, or [1]-[5] to select it directly before recording.")
+                logger_mp.info("🟡  Press [n]/[p] to switch button subtask, or [1]-[6] to select it directly before recording.")
                 log_current_button_subtask(prefix="Initial")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
