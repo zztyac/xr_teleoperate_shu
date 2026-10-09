@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Group episode ids into continuous task intervals ordered by button_subtasks.json.
+"""Group episodes by task and renumber them continuously from episode_0000.
 
 Dry run:
-    python3 reorder_vehicle_episodes_by_subtask.py
+    python3 scripts/reorder_vehicle_episodes_by_subtask.py
 
 Apply directory renames:
-    python3 reorder_vehicle_episodes_by_subtask.py --apply
+    python3 scripts/reorder_vehicle_episodes_by_subtask.py --apply
 
 Write a mapping file while applying or dry-running:
-    python3 reorder_vehicle_episodes_by_subtask.py --mapping-json /tmp/episode_mapping.json
+    python3 scripts/reorder_vehicle_episodes_by_subtask.py \
+        --mapping-json /tmp/episode_mapping.json
+
+Episodes are matched to tasks using ``data.json -> text``. The order of task
+blocks follows ``teleop/button_subtasks.json``; the original numeric order is
+preserved inside each task block. The default mode is a read-only dry run.
 """
 
 from __future__ import annotations
@@ -22,12 +27,12 @@ from typing import Any
 
 
 DEFAULT_DATASET_DIR = Path(
-    "/mnt/data/zty/json_data/vehicle_physical_button_press_ccw"
+    "/mnt/data/zty/json_data/vehicle_physical_button_press_zty"
 )
 DEFAULT_SUBTASKS_JSON = Path(
     "/home/ubuntu/zty/xr_teleoperate_shu/teleop/button_subtasks.json"
 )
-DEFAULT_TASK_GROUP = "vehicle_physical_button_press_ccw"
+DEFAULT_TASK_GROUP = "vehicle_physical_button_press_zty"
 EPISODE_RE = re.compile(r"episode_(\d+)$")
 TEMP_PREFIX = ".reorder_tmp_"
 
@@ -215,6 +220,7 @@ def load_episode_text(data_path: Path) -> tuple[str, str, str]:
 
 def iter_episode_dirs(dataset_dir: Path) -> list[tuple[int, Path, Path]]:
     episodes: list[tuple[int, Path, Path]] = []
+    missing_data: list[Path] = []
     for child in dataset_dir.iterdir():
         if not child.is_dir():
             continue
@@ -222,8 +228,22 @@ def iter_episode_dirs(dataset_dir: Path) -> list[tuple[int, Path, Path]]:
         if number is None:
             continue
         data_path = child / "data.json"
-        if data_path.is_file():
-            episodes.append((number, child, data_path))
+        if not data_path.is_file():
+            missing_data.append(data_path)
+            continue
+        episodes.append((number, child, data_path))
+
+    if missing_data:
+        preview = ", ".join(str(path) for path in missing_data[:10])
+        suffix = (
+            ""
+            if len(missing_data) <= 10
+            else f", ... {len(missing_data) - 10} more"
+        )
+        raise FileNotFoundError(
+            f"Found {len(missing_data)} episode directories without data.json: "
+            f"{preview}{suffix}"
+        )
     return sorted(episodes)
 
 
@@ -499,13 +519,31 @@ def write_mapping(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def apply_plan(rename_items: list[RenameItem]) -> None:
-    for item in rename_items:
-        item.episode.path.rename(item.temp)
+    staged: list[RenameItem] = []
+    finalized: list[RenameItem] = []
+    try:
+        # Stage everything first so swaps and overlapping names cannot overwrite
+        # another episode.
+        for item in rename_items:
+            item.episode.path.rename(item.temp)
+            staged.append(item)
 
-    for item in rename_items:
-        if item.target.exists():
-            raise FileExistsError(f"Target exists before final rename: {item.target}")
-        item.temp.rename(item.target)
+        for item in rename_items:
+            if item.target.exists():
+                raise FileExistsError(
+                    f"Target exists before final rename: {item.target}"
+                )
+            item.temp.rename(item.target)
+            finalized.append(item)
+    except Exception:
+        # Restore original directory names if either phase fails.
+        for item in reversed(finalized):
+            if item.target.exists() and not item.temp.exists():
+                item.target.rename(item.temp)
+        for item in reversed(staged):
+            if item.temp.exists() and not item.episode.path.exists():
+                item.temp.rename(item.episode.path)
+        raise
 
 
 def main() -> int:
@@ -516,6 +554,8 @@ def main() -> int:
         raise ValueError(f"--start must be >= 0: {args.start}")
     if args.width < 1:
         raise ValueError(f"--width must be >= 1: {args.width}")
+    if args.preview < 0:
+        raise ValueError(f"--preview must be >= 0: {args.preview}")
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
     if not subtasks_path.is_file():

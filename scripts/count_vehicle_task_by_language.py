@@ -22,7 +22,7 @@ from typing import Any
 
 
 DEFAULT_DATASET_DIR = Path(
-    "/mnt/data/zty/json_data/vehicle_physical_button_press_ccw"
+    "/mnt/data/zty/json_data/vehicle_physical_button_press_zty"
 )
 EPISODE_RE = re.compile(r"episode_(\d+)$")
 

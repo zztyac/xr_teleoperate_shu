@@ -11,12 +11,14 @@ conda activate tv
 cd /home/ubuntu/zty/xr_teleoperate_shu
 1. 验证摄像头正常连接：python -m teleimager.image_client --host 192.168.123.164
 2. 启动遥操作和数据录制：
-  运控模式： python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw --headless
-  debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_ccw --debug-arms-only
+  运控模式： python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903
+  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --headless
+  debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --debug-arms-only
 
-
-初始姿态固定从 teleop/initial_target_poses.json 读取，使用 --task-name 对应 JSON key。
+# 1 95
+# 2 158
+  
+初始姿态固定从 teleop/initial_target_poses.json 读取，使用 --initial-pose-task-name 对应 JSON key。
 
 运行时按键：
   r      开始机器人跟随键盘 / XR 运动
@@ -26,7 +28,7 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
   1-6    录制前直接选择对应的按键子任务
   w / s  末端沿机器人 X 轴正 / 负方向持续移动
   a / d  末端沿机器人 Y 轴正 / 负方向持续移动
-  e / c  末端沿机器人 Z 轴正 / 负方向持续移动
+  e / c  末端沿机器人 Z 轴正 / 负方向持续移动jj
   u / o  末端绕机器人 X 轴负 / 正方向持续旋转
   i / k  末端绕机器人 Y 轴正 / 负方向持续旋转
   j / l  末端绕机器人 Z 轴正 / 负方向持续旋转
@@ -37,17 +39,17 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
 子任务语言从 teleop/button_subtasks.json 按 --task-name 读取；未配置的任务使用命令行默认 task 文本。
 当前物理按键任务的子任务顺序如下，goal 保持英文，作为训练用语言标签：
   1. front_windshield_defrost
-     goal: Press the front windshield defrost button once.
+     goal: Activate the front-windshield defogger with one quick tap.
   2. ac_temperature_down_driver
-     goal: Press the driver air conditioning temperature down button once.
+     goal: Decrease only the driver's climate temperature by one increment.
   3. fan_speed_down
-     goal: Press the fan speed down button once.
+     goal: Reduce cabin blower speed by one level using the fan-minus control.
   4. ac_temperature_down_passenger
-     goal: Press the passenger air conditioning temperature down button once.
+     goal: Lower the front passenger's climate temperature by one increment.
   5. trunk_open_long_press
-     goal: Long-press the trunk open button until the trunk starts opening.
-  6. sunshade_open_long_press
-     goal: Long-press the sunshade open button until the sunshade starts opening.
+     goal: Hold the trunk-release control until the tailgate begins to open.
+  6. sunshade_open_single_press
+     goal: Start opening the panoramic-roof sunshade with one short press.
 
 推荐采集流程：
   1. 按 r 开始机器人跟随。
@@ -56,12 +58,12 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
   4. 按 3，再按 enter 录制空调风速降低；录完后再按 enter 保存。
   5. 按 4，再按 enter 录制副驾驶空调温度降低；录完后再按 enter 保存。
   6. 按 5，再按 enter 录制长按打开后备箱；录完后再按 enter 保存。
-  7. 按 6，再按 enter 录制长按打开遮阳板；录完后再按 enter 保存。
+  7. 按 6，再按 enter 录制单击打开遮阳板；录完后再按 enter 保存。
 
 注意：
   - 当前子任务会在 create_episode() 前写入 recorder.text。
   - 录制过程中禁止切换子任务；需要先按 enter 保存当前 episode。
-  - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
+  - 默认数据保存路径为 /mnt/data/zty/json_data/vehicle_physical_button_press_zty/episode_xxxx/data.json。
 """
 
 
@@ -672,27 +674,27 @@ def load_initial_target_q_from_config(task_name: str, arm: str):
 
 
 def resolve_initial_target_q(args):
-    raw_value = load_initial_target_q_from_config(args.task_name, args.arm)
+    raw_value = load_initial_target_q_from_config(args.initial_pose_task_name, args.arm)
     if raw_value is INITIAL_TARGET_Q_MISSING:
         raise ValueError(
-            f"initial_target_q for task '{args.task_name}' and arm '{args.arm}' "
+            f"initial_target_q for task '{args.initial_pose_task_name}' and arm '{args.arm}' "
             f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. "
             f"Add '{ALL_JOINT_Q_FIELD}' to initial_target_poses.json."
         )
 
     initial_target_q, source_field = parse_initial_target_pose_entry(raw_value, args.arm)
     logger_mp.info(
-        f"Loaded {source_field} for task '{args.task_name}' and arm '{args.arm}' "
+        f"Loaded {source_field} for initial-pose task '{args.initial_pose_task_name}' and arm '{args.arm}' "
         f"from {INITIAL_TARGET_Q_CONFIG_PATH}; using {len(initial_target_q)} dual-arm joints for control."
     )
     return initial_target_q
 
 
 def resolve_initial_full_body_q(args):
-    raw_value = load_initial_target_q_from_config(args.task_name, args.arm)
+    raw_value = load_initial_target_q_from_config(args.initial_pose_task_name, args.arm)
     if raw_value is INITIAL_TARGET_Q_MISSING:
         raise ValueError(
-            f"initial full-body q for task '{args.task_name}' and arm '{args.arm}' "
+            f"initial full-body q for task '{args.initial_pose_task_name}' and arm '{args.arm}' "
             f"was not found in {INITIAL_TARGET_Q_CONFIG_PATH}. "
             f"Add '{ALL_JOINT_Q_FIELD}' to initial_target_poses.json."
         )
@@ -701,11 +703,12 @@ def resolve_initial_full_body_q(args):
     if initial_full_body_q is None:
         raise ValueError(
             f"--debug-full-body requires '{ALL_JOINT_Q_FIELD}' with "
-            f"{ARM_FULL_BODY_DOF[args.arm]} values for task '{args.task_name}' and arm '{args.arm}'."
+            f"{ARM_FULL_BODY_DOF[args.arm]} values for initial-pose task "
+            f"'{args.initial_pose_task_name}' and arm '{args.arm}'."
         )
 
     logger_mp.info(
-        f"Loaded {source_field} for task '{args.task_name}' and arm '{args.arm}' "
+        f"Loaded {source_field} for initial-pose task '{args.initial_pose_task_name}' and arm '{args.arm}' "
         f"from {INITIAL_TARGET_Q_CONFIG_PATH}; using {len(initial_full_body_q)} full-body joints in debug mode."
     )
     return initial_full_body_q
@@ -722,7 +725,7 @@ if __name__ == '__main__':
                         help='Arm end-effector controlled by keyboard in controller input mode.')
     parser.add_argument('--keyboard-linear-speed', type=float, default=0.025,
                         help='Keyboard end-effector translation speed in m/s.')
-    parser.add_argument('--keyboard-angular-speed', type=float, default=0.35,
+    parser.add_argument('--keyboard-angular-speed', type=float, default=0.30,
                         help='Keyboard end-effector rotation speed in rad/s.')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
@@ -744,7 +747,9 @@ if __name__ == '__main__':
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = '/mnt/data/zty/json_data/', help = 'path to save data')
-    parser.add_argument('--task-name', type = str, default = 'vehicle_physical_button_press', help = 'task file name for recording')
+    parser.add_argument('--task-name', type = str, default = 'vehicle_physical_button_press_zty', help = 'task file name for recording')
+    parser.add_argument('--initial-pose-task-name', type=str, default='vehicle_physical_button_press_0903',
+                        help='Task key in initial_target_poses.json used only for the robot initial pose.')
     parser.add_argument('--task-goal', type = str, default = 'Press in-car physical buttons with the BrainCo dexterous hand.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'Collect 30 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')

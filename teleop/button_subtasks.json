@@ -1,4 +1,42 @@
 {
+  "vehicle_physical_button_press_zty": [
+    {
+      "id": "front_windshield_defrost",
+      "goal": "Activate the front-windshield defogger with one quick tap.",
+      "desc": "Demonstrate brief activation of the windshield-clearing control, identified by the heated curved-glass symbol.",
+      "steps": "step1: find the front-windshield defogger control; step2: center the index fingertip over its surface; step3: deliver one short tap without holding; step4: lift the finger clear and withdraw the hand;"
+    },
+    {
+      "id": "ac_temperature_down_driver",
+      "goal": "Decrease only the driver's climate temperature by one increment.",
+      "desc": "Demonstrate a single adjustment to the driver's independent temperature zone while avoiding the fan and passenger controls.",
+      "steps": "step1: locate the driver-zone temperature-down button; step2: approach it with the fingertip aligned to the center; step3: make one discrete press to lower the setting; step4: release immediately and move away;"
+    },
+    {
+      "id": "fan_speed_down",
+      "goal": "Reduce cabin blower speed by one level using the fan-minus control.",
+      "desc": "Demonstrate lowering airflow intensity rather than changing either occupant's temperature setting.",
+      "steps": "step1: identify the control that decreases fan output; step2: position the fingertip squarely above that control; step3: tap once to reduce blower speed one step; step4: remove contact and retreat;"
+    },
+    {
+      "id": "ac_temperature_down_passenger",
+      "goal": "Lower the front passenger's climate temperature by one increment.",
+      "desc": "Demonstrate a one-step change to the front-passenger climate zone while leaving the driver's setting untouched.",
+      "steps": "step1: find the passenger-zone temperature-decrease control; step2: guide the fingertip to its center without contacting nearby buttons; step3: press exactly once; step4: release and return the hand to a safe pose;"
+    },
+    {
+      "id": "trunk_open_long_press",
+      "goal": "Hold the trunk-release control until the tailgate begins to open.",
+      "desc": "Demonstrate the sustained trunk-opening command; success is indicated by the rear tailgate starting to move.",
+      "steps": "step1: locate the trunk-release switch; step2: establish firm fingertip contact; step3: maintain continuous pressure instead of tapping; step4: wait for the tailgate to begin opening; step5: release the switch and pull the hand back;"
+    },
+    {
+      "id": "sunshade_open_single_press",
+      "goal": "Start opening the panoramic-roof sunshade with one short press.",
+      "desc": "Demonstrate a single-tap roof-sunshade command: release the control immediately after activation instead of holding it down.",
+      "steps": "step1: identify the panoramic-roof sunshade-open control; step2: align the fingertip with its center; step3: press once and release immediately; step4: confirm that the overhead shade starts retracting; step5: move the hand clear;"
+    }
+  ],
   "vehicle_physical_button_press": [
     {
       "id": "front_windshield_defrost",

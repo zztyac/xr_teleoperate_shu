@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read the robot's current joint pose without publishing commands.
 
-python teleop/read_initial_pose.py --arm G1_29 --task-name vehicle_physical_button_press_ccw
+python teleop/read_initial_pose.py --arm G1_29 --task-name vehicle_physical_button_press_0903
 
 数据来源说明：
   这个脚本不读取 initial_target_poses.json，也不会向机器人下发控制命令。
