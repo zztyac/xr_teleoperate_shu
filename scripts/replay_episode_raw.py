@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-python3 scripts/replay_episode_raw.py --episode-path /mnt/data/zty/json_data/vehicle_physical_button_press_zty/episode_0005
+python3 scripts/replay_episode_raw.py --episode-path /mnt/data/zty/json_data/turn_signal_stalk/episode_0007
+
+# 1 163-164
+# 2 167-168
+# 3 170-171
+# 4 172-173
+# 5 174-175
+# 6 176-177
 
 新增末端位姿回放：
 python3 scripts/replay_episode_raw.py \

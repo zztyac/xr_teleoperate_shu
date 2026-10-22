@@ -15,9 +15,12 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
   debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --headless
   debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --debug-arms-only
 
-# 1 95
-# 2 158
-  
+# 1 163-164
+# 2 167-168
+# 3 170-171
+# 4 172-173
+# 5 174-175
+# 6 176-177
 初始姿态固定从 teleop/initial_target_poses.json 读取，使用 --initial-pose-task-name 对应 JSON key。
 
 运行时按键：
