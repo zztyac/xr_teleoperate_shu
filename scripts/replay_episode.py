@@ -5,13 +5,19 @@ Default dataset:
     /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0021/data.json.
 
 Examples:
-    python scripts/replay_episode.py --execute
+    python scripts/replay_episode.py --execute --yes --motion
     python scripts/replay_episode.py --camera color_0 --camera color_1 --camera color_2 --camera color_3
     python scripts/replay_episode.py --export-video /tmp/episode_0001.mp4 --no-gui
 
-    python scripts/replay_episode.py --execute --yes --camera color_0 --camera color_1
+    python scripts/replay_episode.py --execute --yes --motion --camera color_0 --camera color_1
 
-    python scripts/replay_episode.py --execute --yes --source states --no-gui --fps 30
+    python scripts/replay_episode.py --execute --yes --motion --source states --no-gui --fps 30
+
+Feedforward defaults to recorded action torque when present, or model gravity
+compensation for old data and state replay. Startup holds and ramps use gravity
+compensation. Use --tau-source gravity to recompute every frame, or zero to
+explicitly disable feedforward. The gravity model matches teleoperation's fixed
+base and locked non-arm joints; it does not estimate payload/contact forces.
 """
 
 from __future__ import annotations
@@ -136,6 +142,14 @@ def parse_args() -> argparse.Namespace:
         help="Replay actions or recorded states to the robot.",
     )
     parser.add_argument(
+        "--tau-source",
+        choices=["auto", "gravity", "recorded", "zero"],
+        default="auto",
+        help="Arm feedforward: auto uses recorded action torques when present, otherwise "
+        "model gravity compensation. State replay always uses gravity in auto mode. "
+        "recorded requires --source actions; zero explicitly disables feedforward.",
+    )
+    parser.add_argument(
         "--initial-target-q",
         "--initial_target_q",
         dest="initial_target_q",
@@ -166,10 +180,16 @@ def parse_args() -> argparse.Namespace:
         help="DDS network interface, for example eth0. Defaults to SDK behavior.",
     )
     parser.add_argument("--sim", action="store_true", help="Use DDS domain 1.")
-    parser.add_argument(
+    control_mode = parser.add_mutually_exclusive_group()
+    control_mode.add_argument(
         "--motion",
         action="store_true",
         help="Use the arm SDK motion topic instead of debug lowcmd topic.",
+    )
+    control_mode.add_argument(
+        "--allow-debug-mode",
+        action="store_true",
+        help="Allow full-body low-level control only with external physical support; releases locomotion.",
     )
     parser.add_argument(
         "--ramp-time",
@@ -199,7 +219,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Call ctrl_dual_arm_go_home() after replay or interruption.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.tau_source == "recorded" and args.source != "actions":
+        parser.error("--tau-source recorded requires --source actions")
+    if args.execute and args.arm != "none" and not args.sim:
+        if not (args.motion or args.allow_debug_mode):
+            parser.error(
+                "Real-robot arm replay requires --motion with locomotion already running. "
+                "Default debug control is blocked because releasing locomotion can cause a fall. "
+                "Use --allow-debug-mode only with external physical support."
+            )
+        if args.motion and args.arm == "H1":
+            parser.error("H1 has no motion-mode arm controller; --motion would still use lowcmd.")
+    return args
 
 
 def load_episode(episode_dir: Path) -> dict[str, Any]:
@@ -437,6 +469,85 @@ def collect_arm_targets(
     return [extract_dual_arm_q(frame, source) for frame in frames]
 
 
+def extract_action_arm_tau(frame: dict[str, Any], dof: int) -> np.ndarray | None:
+    """Recorded command feedforward; measured state torque is not feedforward."""
+    actions = frame.get("actions") or {}
+    left = (actions.get("left_arm") or {}).get("torque", [])
+    right = (actions.get("right_arm") or {}).get("torque", [])
+    if len(left) == 0 and len(right) == 0:
+        return None
+    if len(left) != dof // 2 or len(right) != dof // 2:
+        raise ValueError(f"Recorded arm torque must contain {dof // 2} values per arm")
+    tau = np.asarray(list(left) + list(right), dtype=float)
+    if tau.shape != (dof,) or not np.all(np.isfinite(tau)):
+        raise ValueError("Recorded arm torque must be a finite joint vector")
+    return tau
+
+
+def create_gravity_solver(arm_name: str):
+    """Use the same reduced robot model and rnea(q, 0, 0) as teleoperation."""
+    import pinocchio as pin
+    from teleop.robot_control import robot_arm_ik
+
+    arm_ik = getattr(robot_arm_ik, f"{arm_name}_ArmIK")()
+    model = arm_ik.reduced_robot.model
+    data = model.createData()
+    zero = np.zeros(model.nv)
+
+    def solve(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=float)
+        if q.shape != (model.nq,) or not np.all(np.isfinite(q)):
+            raise ValueError(f"Gravity model for {arm_name} needs {model.nq} finite joint positions")
+        tau = np.asarray(pin.rnea(model, data, q, zero, zero), dtype=float).copy()
+        if tau.shape != q.shape or not np.all(np.isfinite(tau)):
+            raise ValueError("Gravity solver returned an invalid arm torque vector")
+        return tau
+
+    return solve
+
+
+def prepare_arm_torques(
+    frames: list[dict[str, Any]],
+    targets: list[np.ndarray | None],
+    source: str,
+    tau_source: str,
+    arm_name: str,
+):
+    """Validate all replay feedforward before initializing any robot controller."""
+    dof = ARM_TARGET_DOF[arm_name]
+    if tau_source == "recorded" and source != "actions":
+        raise ValueError("Recorded feedforward requires action targets")
+    if tau_source == "zero":
+        solve = lambda q: np.zeros(dof, dtype=float)
+    else:
+        # Also needed for the current-pose hold and interpolated startup poses,
+        # where recorded per-frame feedforward does not apply.
+        solve = create_gravity_solver(arm_name)
+    torques = []
+    recorded_count = 0
+    gravity_count = 0
+    for pos, (frame, q) in enumerate(zip(frames, targets)):
+        if q is None:
+            torques.append(None)
+            continue
+        if q.shape != (dof,) or not np.all(np.isfinite(q)):
+            raise ValueError(f"Arm target at selected frame {pos} needs {dof} finite joint positions")
+        tau = None
+        if source == "actions" and tau_source in ("auto", "recorded"):
+            tau = extract_action_arm_tau(frame, dof)
+        if tau is None:
+            if tau_source == "recorded":
+                raise ValueError(f"Missing recorded action torque at selected frame {pos}")
+            tau = solve(q)
+            gravity_count += int(tau_source != "zero")
+        else:
+            recorded_count += 1
+        torques.append(tau)
+    print(f"Arm feedforward: mode={tau_source}, recorded={recorded_count}, "
+          f"gravity={gravity_count}, startup={'zero' if tau_source == 'zero' else 'gravity'}")
+    return solve, torques
+
+
 def collect_hand_targets(
     frames: list[dict[str, Any]], source: str
 ) -> list[tuple[np.ndarray, np.ndarray] | None]:
@@ -553,6 +664,7 @@ def execute_robot_replay(
     go_home: bool,
     tile_width: int,
     show_gui: bool,
+    tau_source: str = "auto",
 ) -> None:
     use_arm = arm_name != "none"
     use_hand = ee_name != "none"
@@ -574,6 +686,11 @@ def execute_robot_replay(
             f"--max-frame-arm-delta {max_frame_arm_delta:.3f}"
         )
 
+    if use_arm:
+        solve_tau, arm_torques = prepare_arm_torques(
+            frames, arm_targets, source, tau_source, arm_name
+        )
+
     print("Initializing DDS and robot controllers...")
     initialize_dds(sim=sim, network_interface=network_interface)
     if use_arm and not motion and not sim:
@@ -587,9 +704,9 @@ def execute_robot_replay(
         else None
     )
     hand_ctrl = BraincoDirectController() if use_hand else None
-    tau = np.zeros(14, dtype=float)
     if arm_ctrl is not None:
-        arm_ctrl.ctrl_dual_arm(arm_ctrl.get_current_dual_arm_q(), tau)
+        current_q = arm_ctrl.get_current_dual_arm_q()
+        arm_ctrl.ctrl_dual_arm(current_q, solve_tau(current_q))
     window_name = f"Episode Execute - {episode_dir.name}"
 
     try:
@@ -613,7 +730,7 @@ def execute_robot_replay(
                     loop_start = time.time()
                     ratio = step / initial_ramp_steps
                     target = current_arm_q + (initial_target_q - current_arm_q) * ratio
-                    arm_ctrl.ctrl_dual_arm(target, tau)
+                    arm_ctrl.ctrl_dual_arm(target, solve_tau(target))
                     sleep_to_rate(loop_start, fps=fps, speed=1.0)
                 ramp_start_q = arm_ctrl.get_current_dual_arm_q()
 
@@ -635,7 +752,7 @@ def execute_robot_replay(
                 loop_start = time.time()
                 ratio = step / ramp_steps
                 target = ramp_start_q + (first_arm_target - ramp_start_q) * ratio
-                arm_ctrl.ctrl_dual_arm(target, tau)
+                arm_ctrl.ctrl_dual_arm(target, solve_tau(target))
                 sleep_to_rate(loop_start, fps=fps, speed=1.0)
 
         if hand_ctrl is not None:
@@ -651,7 +768,7 @@ def execute_robot_replay(
             if arm_ctrl is not None:
                 arm_target = arm_targets[pos]
                 if arm_target is not None:
-                    arm_ctrl.ctrl_dual_arm(arm_target, tau)
+                    arm_ctrl.ctrl_dual_arm(arm_target, arm_torques[pos])
             if hand_ctrl is not None:
                 hand_target = hand_targets[pos]
                 if hand_target is not None:
@@ -869,6 +986,7 @@ def main() -> int:
                 go_home=args.go_home,
                 tile_width=args.tile_width,
                 show_gui=show_gui,
+                tau_source=args.tau_source,
             )
             return 0
 

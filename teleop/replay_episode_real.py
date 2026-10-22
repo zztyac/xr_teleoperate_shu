@@ -4,7 +4,7 @@ Default target data:
   /mnt/data/zty/json_data/vehicle_physical_button_press/episode_0003
 
 Example:
-  python teleop/replay_episode_real.py --yes
+  python teleop/replay_episode_real.py --motion
   python teleop/replay_episode_real.py --dry-run
 
 This script replays the recorded joint-space data directly. It does not start
@@ -48,7 +48,7 @@ from teleop.robot_control.robot_hand_brainco import (
 from teleop.utils.motion_switcher import MotionSwitcher
 
 
-DEFAULT_EPISODE_DIR = "/mnt/data/zty/json_data/vehicle_physical_button_press/episode_0003"
+DEFAULT_EPISODE_DIR = "/mnt/data/zty/json_data/open_close_car/episode_0020"
 
 ARM_CONTROLLER_BY_NAME = {
     "G1_29": G1_29_ArmController,
@@ -248,11 +248,26 @@ def parse_args():
     parser.add_argument("--settle-tolerance", type=float, default=0.04)
     parser.add_argument("--settle-timeout", type=float, default=3.0)
     parser.add_argument("--network-interface", type=str, default=None)
-    parser.add_argument("--motion", action="store_true", help="Use motion-mode arm topic instead of debug topic.")
+    control_mode = parser.add_mutually_exclusive_group()
+    control_mode.add_argument("--motion", action="store_true", help="Use motion-mode arm topic alongside running locomotion.")
+    control_mode.add_argument(
+        "--allow-debug-mode", action="store_true",
+        help="Allow full-body low-level control only with external physical support; releases locomotion.",
+    )
     parser.add_argument("--sim", action="store_true", help="Use DDS domain 1 for simulator checks.")
     parser.add_argument("--dry-run", action="store_true", help="Only validate and print episode summary.")
     parser.add_argument("--yes", action="store_true", help="Skip the interactive safety confirmation.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (args.dry_run or args.sim):
+        if not (args.motion or args.allow_debug_mode):
+            parser.error(
+                "Real-robot replay requires --motion with locomotion already running. "
+                "Default debug control is blocked because releasing locomotion can cause a fall. "
+                "Use --allow-debug-mode only with external physical support."
+            )
+        if args.motion and args.arm == "H1":
+            parser.error("H1 has no motion-mode arm controller; --motion would still use lowcmd.")
+    return args
 
 
 def main():

@@ -39,10 +39,16 @@ def parse_args() -> argparse.Namespace:
         const="none",
         help="Do not replay end-effector states.",
     )
-    parser.add_argument(
+    control_mode = parser.add_mutually_exclusive_group()
+    control_mode.add_argument(
         "--motion",
         action="store_true",
-        help="Enable robot motion mode.",
+        help="Use rt/arm_sdk alongside the robot's running locomotion controller.",
+    )
+    control_mode.add_argument(
+        "--allow-debug-mode",
+        action="store_true",
+        help="Allow full-body low-level control only with external physical support; releases locomotion.",
     )
     parser.add_argument(
         "--sim",
@@ -111,7 +117,15 @@ def parse_args() -> argparse.Namespace:
         default=25,
         help="Log one state target every N frames. Use 1 to log every frame.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (args.dry_run or args.sim or args.motion or args.allow_debug_mode):
+        parser.error(
+            "Real-robot replay requires --motion with locomotion already running. "
+            "Default debug control is blocked because releasing locomotion can cause a fall. "
+            "--skip-debug-mode does not change the full-body lowcmd topic. "
+            "Use --allow-debug-mode only with external physical support."
+        )
+    return args
 
 
 def resolve_data_path(path: Path) -> Path:
@@ -304,6 +318,11 @@ def replay(args: argparse.Namespace) -> None:
         arm_dim,
         left_ee_dim,
         right_ee_dim,
+    )
+    logger.info(
+        "control mode=%s arm_topic=%s source=states body_replay=disabled",
+        "motion" if args.motion else "debug",
+        "rt/arm_sdk" if args.motion else "rt/lowcmd",
     )
 
     if args.dry_run:

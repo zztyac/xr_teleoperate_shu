@@ -1,4 +1,5 @@
-"""车内物理按键数据采集
+"""
+车内物理按键、车门开关与转向灯拨杆任务数据采集
 
 使用真实相机时，先启动图像服务：
 机器人端：
@@ -11,20 +12,21 @@ PC 端：
    python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
 cd /home/ubuntu/zty/xr_teleoperate_shu
-motion : python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press
-debug : python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press
+motion: python teleop/teleop_hand_and_arm.py --record --motion --task-name trunk_open
+debug : python teleop/teleop_hand_and_arm.py --record --task-name trunk_open
 
-车内初始姿态默认从 teleop/initial_target_poses.json 读取。
-如需切换姿态，可使用 --initial-target-q-name 指定配置中的姿态名。
+G1_29 启动后保持当前双臂、腿和腰的位置，不读取初始姿态配置。
+按 r 后直接开始 VR 跟随；腿和腰继续保持启动时的位置。
 
 运行时按键：
   r      开始机器人跟随 XR 运动
   q      停止并退出程序
   s      开始录制当前 episode，或保存正在录制的 episode
-  n / p  录制前切换到下一个 / 上一个按键子任务
-  1-5    录制前直接选择对应的按键子任务
+  n / p  录制前切换到下一个 / 上一个子任务
+  1-9 / 0  录制前直接选择对应的子任务（0 为第 10 项）
 
 每个 episode 会把当前选择的子任务写入 data.json -> text。
+启动时默认选择第 9 项：往下拨转向灯拨杆。
 子任务顺序如下，goal 保持英文，作为训练用语言标签：
   1. front_windshield_defrost
      goal: Press the front windshield defrost button once.
@@ -36,19 +38,26 @@ debug : python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physic
      goal: Long-press the trunk open button until the trunk starts opening.
   5. sunshade_open_long_press
      goal: Long-press the sunshade open button until the sunshade starts opening.
+  6. trunk_open
+     goal: Press the trunk open button once to open the trunk.
+  7. car_door_open
+     goal: Open the car door by scanning the car key card.
+  8. car_door_close
+     goal: Close the car door by scanning the car key card.
+  9. turn_signal_stalk_down
+     goal: Push the turn signal stalk down.
+  10. turn_signal_stalk_up
+      goal: Push the turn signal stalk up.
 
-推荐采集流程：
-  1. 按 r 开始机器人跟随。
-  2. 按 1，再按 s 录制前窗除雾；录完后再按 s 保存。
-  3. 按 2，再按 s 录制空调温度降低；录完后再按 s 保存。
-  4. 按 3，再按 s 录制空调风速降低；录完后再按 s 保存。
-  5. 按 4，再按 s 录制长按打开后备箱；录完后再按 s 保存。
-  6. 按 5，再按 s 录制长按打开遮阳板；录完后再按 s 保存。
+
+转向灯拨杆采集：按 9 选择往下拨，按 0 选择往上拨；按 s 开始/保存。
+两条语言标签保存于同一任务目录，每个 episode 的 text 区分方向。
+车内坐姿使用 G1_29 debug 模式，不加 --motion；无需读取或保存初始姿态。
 
 注意：
   - 当前子任务会在 create_episode() 前写入 recorder.text。
   - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
-  - 数据保存路径为 <task-dir>/vehicle_physical_button_press/episode_xxxx/data.json。
+  - 默认数据保存路径为 <task-dir>/turn_signal_stalk/episode_xxxx/data.json。
 """
 
 
@@ -56,6 +65,7 @@ import time
 import argparse
 import ast
 import json
+import math
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -93,7 +103,7 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
-CURRENT_BUTTON_SUBTASK_IDX = 0
+CURRENT_BUTTON_SUBTASK_IDX = 8  # 默认任务：往下拨转向灯拨杆
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -139,6 +149,36 @@ BUTTON_SUBTASKS = [
         "desc": "Collect a demonstration for the in-car physical button task: sunshade open by long press.",
         "steps": LONG_PRESS_STEPS,
     },
+    {
+        "id": "trunk_open",
+        "goal": "Press the trunk open button once to open the trunk.",
+        "desc": "Collect a demonstration for the in-car physical button task: trunk open by a single press.",
+        "steps": SHORT_PRESS_STEPS,
+    },
+    {
+        "id": "car_door_open",
+        "goal": "Open the car door by scanning the car key card.",
+        "desc": "Collect a demonstration of the robot using a car key card to trigger the car door to open.",
+        "steps": "step1: hold the car key card with the dexterous hand; step2: move the card to the car's card reader; step3: align the card with the reader and hold it within scanning range; step4: wait for the card to be recognized and the door to open; step5: move the card away and return to a safe pose;",
+    },
+    {
+        "id": "car_door_close",
+        "goal": "Close the car door by scanning the car key card.",
+        "desc": "Collect a demonstration of the robot using a car key card to trigger the car door to close.",
+        "steps": "step1: hold the car key card with the dexterous hand; step2: move the card to the car's card reader; step3: align the card with the reader and hold it within scanning range; step4: wait for the card to be recognized and the door to close; step5: move the card away and return to a safe pose;",
+    },
+    {
+        "id": "turn_signal_stalk_down",
+        "goal": "Push the turn signal stalk down.",
+        "desc": "Collect a demonstration of moving the turn signal stalk downward with the dexterous hand.",
+        "steps": "step1: move the dexterous hand to the turn signal stalk; step2: align the fingers with the stalk; step3: push the stalk down; step4: release the stalk and return to a safe pose;",
+    },
+    {
+        "id": "turn_signal_stalk_up",
+        "goal": "Push the turn signal stalk up.",
+        "desc": "Collect a demonstration of moving the turn signal stalk upward with the dexterous hand.",
+        "steps": "step1: move the dexterous hand to the turn signal stalk; step2: align the fingers with the stalk; step3: push the stalk up; step4: release the stalk and return to a safe pose;",
+    },
 ]
 
 
@@ -176,8 +216,8 @@ def on_press(key):
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX + 1)
     elif key == 'p':
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX - 1)
-    elif key in ('1', '2', '3', '4', '5'):
-        select_button_subtask(int(key) - 1)
+    elif key in ('1', '2', '3', '4', '5', '6', '7', '8', '9', '0'):
+        select_button_subtask(9 if key == '0' else int(key) - 1)
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -224,6 +264,8 @@ def parse_initial_target_q(raw_value, expected_dof: int):
 
     if len(values) != expected_dof:
         raise ValueError(f"initial_target_q for this arm must have {expected_dof} values, got {len(values)}.")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Initial joint positions must be finite.")
     return values
 
 
@@ -244,7 +286,10 @@ def load_named_initial_target_q(config_path: str, pose_name: str, arm: str):
     if pose_entry is None:
         return INITIAL_TARGET_Q_MISSING
     if isinstance(pose_entry, dict):
-        return pose_entry.get(arm, INITIAL_TARGET_Q_MISSING)
+        model_entry = pose_entry.get(arm, INITIAL_TARGET_Q_MISSING)
+        if isinstance(model_entry, dict):
+            return model_entry.get("dual_arm_q", INITIAL_TARGET_Q_MISSING)
+        return model_entry
     return pose_entry
 
 
@@ -259,18 +304,43 @@ def resolve_initial_target_q(args):
 
     raw_value = load_named_initial_target_q(args.initial_target_q_file, pose_name, args.arm)
     if raw_value is INITIAL_TARGET_Q_MISSING:
-        if args.initial_target_q_name is not None:
+        if pose_name is not None:
             raise ValueError(
-                f"initial target q name '{args.initial_target_q_name}' for arm '{args.arm}' "
+                f"initial target q name '{pose_name}' for arm '{args.arm}' "
                 f"was not found in {args.initial_target_q_file}."
             )
         return None
 
+    target_q = parse_initial_target_q(raw_value, expected_dof)
+    if target_q is None:
+        raise ValueError(f"initial target q '{pose_name}' for arm '{args.arm}' must not be null.")
     logger_mp.info(
-        f"Loaded initial_target_q '{pose_name}' for {args.arm} from {args.initial_target_q_file}."
+        f"Loaded initial_target_q '{pose_name}' for {args.arm} from {args.initial_target_q_file}: {target_q}"
     )
-    return parse_initial_target_q(raw_value, expected_dof)
+    return target_q
 
+
+
+def resolve_initial_body_q(args):
+    pose_name = args.initial_target_q_name or (args.task_name if args.record else None)
+    if not pose_name:
+        return None
+    if not os.path.exists(args.initial_target_q_file):
+        return None
+    with open(args.initial_target_q_file) as f:
+        entry = json.load(f).get(pose_name, {})
+    model_entry = entry.get(args.arm, {}) if isinstance(entry, dict) else {}
+    raw = model_entry.get("body_q") if isinstance(model_entry, dict) else None
+    if raw is None:
+        return None
+    if args.motion or args.arm != "G1_29":
+        raise ValueError("Full-body initial poses require G1_29 debug mode (omit --motion).")
+    body_q = parse_initial_target_q(raw, 29)
+    if args.initial_target_q is None:
+        arm_q = resolve_initial_target_q(args)
+        if arm_q != body_q[15:29]:
+            raise ValueError("dual_arm_q must match body_q joints 15-28.")
+    return body_q
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -283,7 +353,7 @@ if __name__ == '__main__':
                         help='Initial dual-arm joint target, e.g. "[0, 0, ...]" or "0,0,...". Overrides the named JSON config.')
     parser.add_argument('--initial-target-q-file', '--initial-target-pose-file', dest='initial_target_q_file',
                         type=str, default=INITIAL_TARGET_Q_CONFIG_PATH,
-                        help='JSON file containing named initial dual-arm joint targets.')
+                        help='JSON file containing named dual-arm or G1_29 full-body initial poses.')
     parser.add_argument('--initial-target-q-name', '--initial-target-pose', dest='initial_target_q_name',
                         type=str, default=None,
                         help='Named initial target in the JSON file. Default uses --task-name when --record is enabled.')
@@ -299,17 +369,25 @@ if __name__ == '__main__':
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = '/mnt/data/zty/json_data/', help = 'path to save data')
-    parser.add_argument('--task-name', type = str, default = 'vehicle_physical_button_press', help = 'task file name for recording')
+    parser.add_argument('--task-name', type = str, default = 'turn_signal_stalk', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'Press in-car physical buttons with the BrainCo dexterous hand.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'Collect 30 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
     try:
-        initial_target_q = resolve_initial_target_q(args)
+        if args.arm == "G1_29":
+            # Preserve the live seated pose; task names only select recording labels/paths.
+            initial_target_q = None
+            initial_body_q = None
+        else:
+            initial_target_q = resolve_initial_target_q(args)
+            initial_body_q = resolve_initial_body_q(args)
     except ValueError as e:
         parser.error(str(e))
-    button_subtask_mode = args.record and args.task_name == 'vehicle_physical_button_press'
+    button_subtask_mode = args.record and args.task_name in (
+        'vehicle_physical_button_press', 'trunk_open', 'open_close_car', 'turn_signal_stalk'
+    )
     logger_mp.debug(f"args: {args}")
 
     try:
@@ -339,7 +417,7 @@ if __name__ == '__main__':
         if not isinstance(xr_camera_config, dict):
             raise RuntimeError(
                 f"VR display camera '{xr_camera_name}' is not configured. "
-                "Please enable right_side_camera in the teleimager camera config."
+                f"Please enable {xr_camera_name} in the teleimager camera config."
             )
         right_side_camera_enabled = camera_config.get('right_side_camera', {}).get('enable_zmq', False)
         left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
@@ -348,7 +426,7 @@ if __name__ == '__main__':
         xr_need_local_img = not (args.display_mode == 'pass-through' or xr_camera_config['enable_webrtc'])
         logger_mp.info(f"VR display camera source: {xr_camera_name}")
 
-        # televuer_wrapper: obtain XR pose data and transmit the right-side camera image to the XR device.
+        # televuer_wrapper: obtain XR pose data and transmit the head camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
                                      binocular=xr_camera_config['binocular'],
                                      img_shape=xr_camera_config['image_shape'],
@@ -369,11 +447,13 @@ if __name__ == '__main__':
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            if status != 0:
+                raise RuntimeError('Cannot initialize full-body control: entering debug mode failed.')
 
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
+            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q, initial_body_q=initial_body_q)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim, initial_target_q=initial_target_q)
@@ -475,11 +555,11 @@ if __name__ == '__main__':
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info("🟢  Holding current pose. Press [r] to start syncing with XR.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
             if button_subtask_mode:
-                logger_mp.info("🟡  Press [n]/[p] to switch button subtask, or [1]-[5] to select it directly before recording.")
+                logger_mp.info("🟡  Press [n]/[p] to switch subtask, or [1]-[9]/[0] to select it directly (0 selects subtask 10) before recording.")
                 log_current_button_subtask(prefix="Initial")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
@@ -488,13 +568,14 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if right_side_camera_enabled and xr_need_local_img:
-                right_side_img = img_client.get_right_side_frame()
-                if right_side_img.bgr is not None:
-                    tv_wrapper.render_to_xr(right_side_img.bgr)
+            if xr_camera_config['enable_zmq'] and xr_need_local_img:
+                head_img = img_client.get_head_frame()
+                if head_img.bgr is not None:
+                    tv_wrapper.render_to_xr(head_img.bgr)
 
-        logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        arm_ctrl.speed_gradual_max()
+        if not STOP:
+            logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+            arm_ctrl.speed_gradual_max()
 
         head_img = None
         right_side_img = None
@@ -506,13 +587,13 @@ if __name__ == '__main__':
             start_time = time.time()
             # get image
             if camera_config['head_camera']['enable_zmq']:
-                if args.record:
-                    head_img = img_client.get_head_frame()
-            if right_side_camera_enabled:
                 if args.record or xr_need_local_img:
+                    head_img = img_client.get_head_frame()
+                    if xr_need_local_img and head_img.bgr is not None:
+                        tv_wrapper.render_to_xr(head_img.bgr)
+            if right_side_camera_enabled:
+                if args.record:
                     right_side_img = img_client.get_right_side_frame()
-                if xr_need_local_img and right_side_img.bgr is not None:
-                    tv_wrapper.render_to_xr(right_side_img.bgr)
             if left_wrist_camera_enabled:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -726,12 +807,12 @@ if __name__ == '__main__':
                         "left_arm": {                                   
                             "qpos":   left_arm_action.tolist(),       
                             "qvel":   [],       
-                            "torque": [],      
+                            "torque": sol_tauff[:7].tolist(),
                         }, 
                         "right_arm": {                                   
                             "qpos":   right_arm_action.tolist(),       
                             "qvel":   [],       
-                            "torque": [],       
+                            "torque": sol_tauff[-7:].tolist(),
                         },                         
                         "left_ee": {                                   
                             "qpos":   left_hand_action,       
@@ -767,7 +848,10 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            if args.arm == "G1_29":
+                arm_ctrl.ctrl_dual_arm(arm_ctrl.get_current_dual_arm_q(), arm_ctrl.tauff_target.copy())
+            else:
+                arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         

@@ -74,9 +74,17 @@ def _resolve_initial_target_q(initial_target_q, dof: int, controller_name: str):
     return target_q.copy()
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None):
+    def __init__(self, motion_mode = False, simulation_mode = False, initial_target_q = None, initial_body_q = None):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "G1_29_ArmController")
+        self.initial_body_q = None
+        if initial_body_q is not None:
+            body_q = np.asarray(initial_body_q, dtype=float).reshape(-1)
+            if motion_mode or body_q.size != 29 or not np.all(np.isfinite(body_q)):
+                raise ValueError("Full-body pose requires debug mode and 29 finite joint positions.")
+            self.initial_body_q = body_q.copy()
+        self.initial_pose_active = False
+        self.initial_pose_transition = False
         self.q_target = self.initial_target_q.copy()
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
@@ -89,7 +97,7 @@ class G1_29_ArmController:
         self.kd_wrist = 1.5
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = 0.3 if self.initial_body_q is not None else 20.0
         self.control_dt = 1.0 / 250.0
 
         self._speed_gradual_max = False
@@ -122,6 +130,11 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # Hold measured arm positions until the user presses r.
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.arm_command_q = self.q_target.copy()
+        if initial_target_q is None:
+            self.initial_target_q = self.q_target.copy()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -144,6 +157,8 @@ class G1_29_ArmController:
                     self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
+        self.body_command_q = self.all_motor_q[:15].copy()
+        self.body_velocity_limit = 0.3  # rad/s for smooth leg/waist restoration
         logger_mp.info("Lock OK!")
 
         # initialize publish thread
@@ -166,7 +181,9 @@ class G1_29_ArmController:
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
-        current_q = self.get_current_dual_arm_q()
+        # During restoration, advance the commanded trajectory each cycle.
+        # Advancing from measured q alone can stall under gravity at low speed.
+        current_q = self.arm_command_q if self.initial_pose_transition else self.get_current_dual_arm_q()
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
@@ -188,6 +205,17 @@ class G1_29_ArmController:
             else:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
+            self.arm_command_q = cliped_arm_q_target.copy()
+
+            if self.initial_pose_active and self.initial_body_q is not None:
+                delta = self.initial_body_q[:15] - self.body_command_q
+                self.body_command_q += np.clip(delta, -self.body_velocity_limit * self.control_dt,
+                                               self.body_velocity_limit * self.control_dt)
+                for id in range(15):
+                    self.msg.motor_cmd[id].q = float(self.body_command_q[id])
+                    self.msg.motor_cmd[id].dq = 0
+                    self.msg.motor_cmd[id].tau = 0
+
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
@@ -206,6 +234,46 @@ class G1_29_ArmController:
             time.sleep(sleep_time)
             # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
             # logger_mp.debug(f"sleep_time:{sleep_time}")
+
+    def move_to_initial_pose(self, should_stop=lambda: False, timeout=30.0, arm_tolerance=0.08, body_tolerance=0.05):
+        """Restore the configured pose before accepting XR targets."""
+        with self.ctrl_lock:
+            self._speed_gradual_max = False
+            self.arm_velocity_limit = 0.3
+            self.arm_command_q = self.get_current_dual_arm_q().copy()
+            self.initial_pose_transition = True
+            self.q_target = self.initial_target_q.copy()
+            self.tauff_target = np.zeros(14)
+            self.initial_pose_active = True
+        deadline = time.monotonic() + timeout
+        next_log = 0.0
+        while not should_stop() and time.monotonic() < deadline:
+            arms_ready = np.all(np.abs(self.get_current_dual_arm_q() - self.initial_target_q) < arm_tolerance)
+            body_ready = self.initial_body_q is None or np.all(
+                np.abs(self.get_current_motor_q()[:15] - self.initial_body_q[:15]) < body_tolerance)
+            if time.monotonic() >= next_log:
+                arm_error = float(np.max(np.abs(self.get_current_dual_arm_q() - self.initial_target_q)))
+                body_error = 0.0 if self.initial_body_q is None else float(np.max(
+                    np.abs(self.get_current_motor_q()[:15] - self.initial_body_q[:15])))
+                logger_mp.info(f"Initial pose progress: arm error={arm_error:.3f} rad, leg/waist error={body_error:.3f} rad")
+                next_log = time.monotonic() + 2.0
+            if arms_ready and body_ready:
+                with self.ctrl_lock:
+                    self.initial_pose_transition = False
+                logger_mp.info("Initial pose reached; starting XR tracking.")
+                return True
+            time.sleep(0.02)
+        # A cancelled or failed transition holds the current pose.
+        with self.ctrl_lock:
+            self.q_target = self.get_current_dual_arm_q().copy()
+            self.initial_pose_active = False
+            self.initial_pose_transition = False
+            if self.initial_body_q is not None:
+                self.body_command_q = self.get_current_motor_q()[:15].copy()
+                for id in range(15):
+                    self.msg.motor_cmd[id].q = float(self.body_command_q[id])
+        logger_mp.warning("Initial pose transition stopped or timed out; XR tracking will not start.")
+        return False
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
