@@ -12,8 +12,8 @@ PC 端：
    python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
 cd /home/ubuntu/zty/xr_teleoperate_shu
-motion: python teleop/teleop_hand_and_arm.py --record --motion --task-name trunk_open
-debug : python teleop/teleop_hand_and_arm.py --record --task-name trunk_open
+motion: python teleop/teleop_hand_and_arm.py --record --motion --task-name turn_signal_stalk
+debug : python teleop/teleop_hand_and_arm.py --record --task-name turn_signal_stalk
 
 G1_29 启动后保持当前双臂、腿和腰的位置，不读取初始姿态配置。
 按 r 后直接开始 VR 跟随；腿和腰继续保持启动时的位置。
@@ -58,6 +58,8 @@ G1_29 启动后保持当前双臂、腿和腰的位置，不读取初始姿态�
   - 当前子任务会在 create_episode() 前写入 recorder.text。
   - 录制过程中禁止切换子任务；需要先按 s 保存当前 episode。
   - 默认数据保存路径为 <task-dir>/turn_signal_stalk/episode_xxxx/data.json。
+    默认 task-dir 为 /mnt/data/zty/json_data/，即：
+    /mnt/data/zty/json_data/turn_signal_stalk/episode_xxxx/data.json。
 """
 
 
@@ -370,9 +372,9 @@ if __name__ == '__main__':
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = '/mnt/data/zty/json_data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'turn_signal_stalk', help = 'task file name for recording')
-    parser.add_argument('--task-goal', type = str, default = 'Press in-car physical buttons with the BrainCo dexterous hand.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'Collect 30 FPS demonstrations for in-car physical button press testing.', help = 'task description for recording at json file')
-    parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
+    parser.add_argument('--task-goal', type = str, default = 'Push the turn signal stalk down.', help = 'task goal for recording at json file; selected subtask overrides this in turn_signal_stalk mode')
+    parser.add_argument('--task-desc', type = str, default = 'Collect a demonstration of moving the turn signal stalk downward with the dexterous hand.', help = 'task description for recording at json file')
+    parser.add_argument('--task-steps', type = str, default = 'step1: move the dexterous hand to the turn signal stalk; step2: align the fingers with the stalk; step3: push the stalk down; step4: release the stalk and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
     try:
@@ -547,7 +549,9 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
-            recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
+            recording_dir = os.path.abspath(os.path.join(args.task_dir, args.task_name))
+            logger_mp.info(f"Recording task: {args.task_name}; saving episodes to: {recording_dir}")
+            recorder = EpisodeWriter(task_dir = recording_dir,
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
@@ -560,6 +564,8 @@ if __name__ == '__main__':
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
             if button_subtask_mode:
                 logger_mp.info("🟡  Press [n]/[p] to switch subtask, or [1]-[9]/[0] to select it directly (0 selects subtask 10) before recording.")
+                if args.task_name == 'turn_signal_stalk':
+                    logger_mp.info("🟡  Turn signal stalk: [9] down / [0] up; both directions save to the same task directory.")
                 log_current_button_subtask(prefix="Initial")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")

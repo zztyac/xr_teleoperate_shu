@@ -11,13 +11,10 @@ import numpy as np
 
 
 """
-python /home/ubuntu/zty/xr_teleoperate_shu/scripts/replay_robot_raw_state.py \
-  --episode-path /mnt/data/zty/json_data/open_close_car/episode_0020/data.json \
-  --arm G1_29 \
-  --ee brainco \
-  --frequency 30 \
-  --motion
-  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+/mnt/data/zty/json_data/turn_signal_stalk 下的 11 和 12 号数据集是后备箱任务：
+
+python /home/ubuntu/zty/xr_teleoperate_shu/scripts/replay_robot_raw.py --episode-path /mnt/data/zty/json_data/turn_signal_stalk/episode_0012 --motion --tau-source unitree_lerobot --frequency 15 --arm G1_29
+python /home/ubuntu/zty/xr_teleoperate_shu/scripts/replay_robot_raw.py   --episode-path /mnt/data/zty/json_data/turn_signal_stalk/episode_0009   --arm G1_29   --allow-debug-mode   --skip-debug-mode   --tau-source unitree_lerobot   --frequency 15
 
   
 """
