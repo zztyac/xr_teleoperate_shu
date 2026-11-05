@@ -11,9 +11,7 @@ conda activate tv
 cd /home/ubuntu/zty/xr_teleoperate_shu
 1. 验证摄像头正常连接：python -m teleimager.image_client --host 192.168.123.164
 2. 启动遥操作和数据录制：
-  运控模式： python teleop/teleop_hand_and_arm.py --record --motion --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903
-  debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --headless
-  debug只控制手臂： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --debug-arms-only
+debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --headless
 
 # 1 163-164
 # 2 167-168
@@ -717,6 +715,36 @@ def resolve_initial_full_body_q(args):
     return initial_full_body_q
 
 
+def collect_recording_images(camera_config, camera_frames):
+    """Keep camera slots stable and reject frames with missing enabled images."""
+    colors = {}
+    missing = []
+    binocular = camera_config.get("head_camera", {}).get("binocular", False)
+    camera_slots = {
+        "head_camera": 0,
+        "left_wrist_camera": 2 if binocular else 1,
+        "right_wrist_camera": 3 if binocular else 2,
+        "right_side_camera": 4 if binocular else 3,
+    }
+    for name, slot in camera_slots.items():
+        if not camera_config.get(name, {}).get("enable_zmq", False):
+            continue
+        image = getattr(camera_frames.get(name), "bgr", None)
+        if not EpisodeWriter.is_valid_image(image):
+            missing.append(name)
+            continue
+        if name == "head_camera" and binocular:
+            width = image.shape[1]
+            if width < 2 or width % 2:
+                missing.append(name)
+                continue
+            colors["color_0"] = image[:, :width // 2]
+            colors["color_1"] = image[:, width // 2:]
+        else:
+            colors[f"color_{slot}"] = image
+    return colors, missing
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -1028,6 +1056,7 @@ if __name__ == '__main__':
         right_side_img = None
         left_wrist_img = None
         right_wrist_img = None
+        last_missing_image_warning = float('-inf')
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -1236,52 +1265,20 @@ if __name__ == '__main__':
                 left_arm_ee_action_pose = pose_matrix_to_list(left_wrist_pose)
                 right_arm_ee_action_pose = pose_matrix_to_list(right_wrist_pose)
                 if RECORD_RUNNING:
-                    colors = {}
+                    colors, missing_images = collect_recording_images(camera_config, {
+                        "head_camera": head_img,
+                        "left_wrist_camera": left_wrist_img,
+                        "right_wrist_camera": right_wrist_img,
+                        "right_side_camera": right_side_img,
+                    })
+                    if missing_images:
+                        now = time.monotonic()
+                        if now - last_missing_image_warning >= 1.0:
+                            logger_mp.warning(
+                                f"Skipping recording frame: missing or invalid images from {', '.join(missing_images)}"
+                            )
+                            last_missing_image_warning = now
                     depths = {}
-                    if camera_config['head_camera']['binocular']:
-                        # 双目头部相机左右半幅分别写入 color_0/color_1；
-                        # 后续腕部/侧视相机编号从 color_2 开始，保持数据集通道稳定。
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
-                            colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
-                        else:
-                            logger_mp.warning("Head image is None!")
-                        if left_wrist_camera_enabled:
-                            if left_wrist_img is not None:
-                                colors[f"color_{2}"] = left_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Left wrist image is None!")
-                        if right_wrist_camera_enabled:
-                            if right_wrist_img is not None:
-                                colors[f"color_{3}"] = right_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Right wrist image is None!")
-                        if right_side_camera_enabled:
-                            if right_side_img is not None:
-                                colors[f"color_{4}"] = right_side_img.bgr
-                            else:
-                                logger_mp.warning("Right side image is None!")
-                    else:
-                        # 非双目模式下头部整图占 color_0，腕部/侧视相机编号整体前移一位。
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr
-                        else:
-                            logger_mp.warning("Head image is None!")
-                        if left_wrist_camera_enabled:
-                            if left_wrist_img is not None:
-                                colors[f"color_{1}"] = left_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Left wrist image is None!")
-                        if right_wrist_camera_enabled:
-                            if right_wrist_img is not None:
-                                colors[f"color_{2}"] = right_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Right wrist image is None!")
-                        if right_side_camera_enabled:
-                            if right_side_img is not None:
-                                colors[f"color_{3}"] = right_side_img.bgr
-                            else:
-                                logger_mp.warning("Right side image is None!")
                     states = {
                         "left_arm": {                                                                    
                             "qpos":   left_arm_state.tolist(),    # numpy.array -> list
@@ -1344,11 +1341,12 @@ if __name__ == '__main__':
                             "qpos": current_body_action,
                         }, 
                     }
-                    if args.sim:
-                        sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
-                    else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
+                    if not missing_images:
+                        if args.sim:
+                            sim_state = sim_state_subscriber.read_data()
+                            recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
+                        else:
+                            recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
             current_time = time.time()
             time_elapsed = current_time - start_time

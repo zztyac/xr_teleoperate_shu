@@ -54,6 +54,7 @@ class EpisodeWriter():
         # Initialize the queue and worker thread
         self.item_data_queue = Queue(-1)
         self.stop_worker = False
+        self._worker_error = None
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
@@ -61,7 +62,23 @@ class EpisodeWriter():
         logger_mp.info("==> EpisodeWriter initialized successfully.\n")
     
     def is_ready(self):
+        self.raise_if_failed()
         return self.is_available
+
+    def raise_if_failed(self):
+        if self._worker_error is not None:
+            raise RuntimeError(
+                f"Episode recording failed; the episode was not finalized: {self._worker_error}"
+            ) from self._worker_error
+
+    @staticmethod
+    def is_valid_image(image):
+        return (
+            isinstance(image, np.ndarray)
+            and image.size > 0
+            and image.ndim in (2, 3)
+            and (image.ndim == 2 or image.shape[2] in (1, 3, 4))
+        )
 
     def data_info(self, version='1.0.0', date=None, author=None):
         self.info = {
@@ -95,6 +112,7 @@ class EpisodeWriter():
         Note:
             Once successfully created, this function will only be available again after save_episode complete its save task.
         """
+        self.raise_if_failed()
         if not self.is_available:
             logger_mp.info("==> The class is currently unavailable for new operations. Please wait until ongoing tasks are completed.")
             return False  # Return False if the class is unavailable
@@ -127,13 +145,18 @@ class EpisodeWriter():
         return True  # Return True if the episode is successfully created
         
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+        self.raise_if_failed()
+        for group_name, images in (("colors", colors), ("depths", depths)):
+            for key, image in (images or {}).items():
+                if not self.is_valid_image(image):
+                    raise ValueError(f"Invalid recording image: {group_name}.{key}")
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
         item_data = {
             'idx': self.item_id,
-            'colors': colors,
-            'depths': depths,
+            'colors': dict(colors) if colors is not None else None,
+            'depths': dict(depths) if depths is not None else None,
             'states': states,
             'actions': actions,
             'tactiles': tactiles,
@@ -149,16 +172,44 @@ class EpisodeWriter():
             try:
                 item_data = self.item_data_queue.get(timeout=1)
                 try:
-                    self._process_item_data(item_data)
+                    if self._worker_error is None:
+                        self._process_item_data(item_data)
                 except Exception as e:
-                    logger_mp.info(f"Error processing item_data (idx={item_data['idx']}): {e}")
-                self.item_data_queue.task_done()
+                    self._worker_error = e
+                    logger_mp.error(f"Episode recording failed (idx={item_data['idx']}): {e}")
+                finally:
+                    self.item_data_queue.task_done()
             except Empty:
                 pass
         
             # Check if save_episode was triggered
             if self.need_save and self.item_data_queue.empty():
-                self._save_episode()
+                if self._worker_error is not None:
+                    self.need_save = False
+                else:
+                    try:
+                        self._save_episode()
+                    except Exception as e:
+                        self._worker_error = e
+                        self.need_save = False
+                        logger_mp.error(f"Failed to finalize episode: {e}")
+
+    def _write_images(self, images, directory, group_name, idx, attempted_paths):
+        paths = {}
+        for key, image in (images or {}).items():
+            if not self.is_valid_image(image):
+                raise ValueError(f"Invalid recording image: {group_name}.{key}")
+            name = f'{str(idx).zfill(6)}_{key}.jpg'
+            path = os.path.join(directory, name)
+            attempted_paths.append(path)
+            try:
+                written = cv2.imwrite(path, image)
+            except Exception as e:
+                raise OSError(f"Failed to save {group_name}.{key} image: {path}") from e
+            if not written:
+                raise OSError(f"Failed to save {group_name}.{key} image: {path}")
+            paths[key] = os.path.join(group_name, name)
+        return paths
 
     def _process_item_data(self, item_data):
         idx = item_data['idx']
@@ -166,21 +217,23 @@ class EpisodeWriter():
         depths = item_data.get('depths', {})
         audios = item_data.get('audios', {})
 
-        # Save images
-        if colors:
-            for idx_color, (color_key, color) in enumerate(colors.items()):
-                color_name = f'{str(idx).zfill(6)}_{color_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.color_dir, color_name), color):
-                    logger_mp.info(f"Failed to save color image.")
-                item_data['colors'][color_key] = os.path.join('colors', color_name)
-
-        # Save depths
-        if depths:
-            for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
-                    logger_mp.info(f"Failed to save depth image.")
-                item_data['depths'][depth_key] = os.path.join('depths', depth_name)
+        # Commit image references only after every image in this frame is saved.
+        attempted_paths = []
+        try:
+            color_paths = self._write_images(colors, self.color_dir, 'colors', idx, attempted_paths)
+            depth_paths = self._write_images(depths, self.depth_dir, 'depths', idx, attempted_paths)
+        except Exception:
+            for path in attempted_paths:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError as e:
+                    logger_mp.warning(f"Failed to remove incomplete image {path}: {e}")
+            raise
+        if colors is not None:
+            item_data['colors'] = color_paths
+        if depths is not None:
+            item_data['depths'] = depth_paths
 
         # Save audios
         if audios:
@@ -207,6 +260,7 @@ class EpisodeWriter():
         """
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
+        self.raise_if_failed()
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
 
@@ -225,10 +279,13 @@ class EpisodeWriter():
         """
         Stop the worker thread and ensure all tasks are completed.
         """
-        self.item_data_queue.join()
-        if not self.is_available:  # If self.is_available is False, it means there is still data not saved.
-            self.save_episode()
-        while not self.is_available:
-            time.sleep(0.01)
-        self.stop_worker = True
-        self.worker_thread.join()
+        try:
+            self.item_data_queue.join()
+            if not self.is_available and self._worker_error is None:
+                self.need_save = True
+            while not self.is_available and self._worker_error is None:
+                time.sleep(0.01)
+        finally:
+            self.stop_worker = True
+            self.worker_thread.join()
+        self.raise_if_failed()
