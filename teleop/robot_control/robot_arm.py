@@ -100,6 +100,7 @@ class G1_29_ArmController:
         control_full_body = False,
         body_velocity_limit = 0.5,
         body_ramp_duration = 6.0,
+        hold_measured_legs = False,
     ):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.motion_mode = motion_mode
@@ -126,6 +127,7 @@ class G1_29_ArmController:
         self.tauff_target = np.zeros(14)
         self.body_q_target = None
         self.full_body_q_target = None
+        self.held_leg_q = None
         self.full_body_start_q = None
         self.full_body_ramp_start_time = None
         self.kp_high = 300.0
@@ -189,6 +191,14 @@ class G1_29_ArmController:
             self.full_body_q_target = self.initial_full_body_q[:G1_29_Valid_Motors].copy()
             self.full_body_start_q = self.get_current_valid_motor_q().copy()
             self.full_body_ramp_start_time = time.time()
+            # 坐姿下腿被座椅和地面约束，保存的腿部目标通常到不了；保持启动时实测的腿部角度，
+            # 只把腰部恢复到 all_joint_q，避免腿部电机持续顶着地面用力。
+            if hold_measured_legs:
+                self.held_leg_q = self.full_body_start_q[:12].copy()
+                deviation = float(np.max(np.abs(self.held_leg_q - self.full_body_q_target[:12])))
+                self.full_body_q_target[:12] = self.held_leg_q
+                self.body_q_target[:12] = self.held_leg_q
+                logger_mp.info(f"Hold measured seated legs; max deviation from all_joint_q legs = {deviation:.4f} rad.")
             logger_mp.info("Control G1_29 valid joints 0..28 in debug mode; arms may be updated by IK.")
             logger_mp.info(f"Ramp G1_29 leg and waist joints to all_joint_q over {self.body_ramp_duration:.2f}s.")
         else:

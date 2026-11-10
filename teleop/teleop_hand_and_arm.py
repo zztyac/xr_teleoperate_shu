@@ -758,6 +758,10 @@ if __name__ == '__main__':
                         help='Keyboard end-effector translation speed in m/s.')
     parser.add_argument('--keyboard-angular-speed', type=float, default=0.30,
                         help='Keyboard end-effector rotation speed in rad/s.')
+    parser.add_argument('--keyboard-ik-reference', type=str, choices=['initial', 'zero'], default='initial',
+                        help='Null-space reference of the IK regularizer in keyboard mode. '
+                             'initial: pull redundant joints toward initial_target_q so returning home restores '
+                             'the configured joint angles; zero: original behavior (pull toward all-zero joints).')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
@@ -771,6 +775,9 @@ if __name__ == '__main__':
                         help='Legacy velocity limit in rad/s for debug full-body non-arm joints.')
     parser.add_argument('--debug-full-body-ramp-duration', type=float, default=6.0,
                         help='Seconds used to ramp G1_29 leg and waist joints to all_joint_q in debug full-body mode.')
+    parser.add_argument('--hold-seated-legs', action=argparse.BooleanOptionalAction, default=True,
+                        help='In debug full-body mode, hold the measured seated leg posture and restore only waist '
+                             'and arms to all_joint_q (default). --no-hold-seated-legs drives legs to all_joint_q.')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
@@ -888,6 +895,7 @@ if __name__ == '__main__':
                 control_full_body=control_debug_full_body,
                 body_velocity_limit=args.debug_full_body_velocity_limit,
                 body_ramp_duration=args.debug_full_body_ramp_duration,
+                hold_measured_legs=args.hold_seated_legs,
             )
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
@@ -979,6 +987,13 @@ if __name__ == '__main__':
                 initial_left_target=keyboard_initial_left_pose,
                 initial_right_target=keyboard_initial_right_pose,
             )
+            # 7 自由度手臂对同一末端位姿有无穷多组关节解。原正则项把冗余自由度拉向全零，
+            # 使空格回位时末端到位但关节构型偏离 initial_target_q（手看起来比初始姿态低）。
+            if args.keyboard_ik_reference == "initial" and hasattr(arm_ik, "set_reference_q"):
+                arm_ik.set_reference_q(arm_ctrl.initial_target_q)
+                logger_mp.info("Keyboard IK null-space reference is set to initial_target_q.")
+            else:
+                logger_mp.info("Keyboard IK null-space reference is all-zero (original behavior).")
         
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:

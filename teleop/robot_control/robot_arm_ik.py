@@ -140,11 +140,14 @@ class G1_29_ArmIK:
         self.opti = casadi.Opti()
         self.var_q = self.opti.variable(self.reduced_robot.model.nq)
         self.var_q_last = self.opti.parameter(self.reduced_robot.model.nq)   # for smooth
+        # 零空间参考姿态：正则项把冗余自由度拉向它。默认全零，与原实现一致；
+        # 键盘采集通过 set_reference_q(initial_target_q) 让末端回到初始位姿时关节也回到初始角。
+        self.var_q_ref = self.opti.parameter(self.reduced_robot.model.nq)
         self.param_tf_l = self.opti.parameter(4, 4)
         self.param_tf_r = self.opti.parameter(4, 4)
         self.translational_cost = casadi.sumsqr(self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
         self.rotation_cost = casadi.sumsqr(self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
-        self.regularization_cost = casadi.sumsqr(self.var_q)
+        self.regularization_cost = casadi.sumsqr(self.var_q - self.var_q_ref)
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
         # Setting optimization constraints and goals
@@ -176,6 +179,7 @@ class G1_29_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
+        self.q_reference = np.zeros(self.reduced_robot.model.nq)
         self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
         self.vis = None
 
@@ -240,6 +244,17 @@ class G1_29_ArmIK:
 
         return robot, reduced_robot
 
+    def set_reference_q(self, q_reference=None):
+        """设置正则项的参考关节角；传 None 恢复原来的全零参考。"""
+        nq = self.reduced_robot.model.nq
+        if q_reference is None:
+            self.q_reference = np.zeros(nq)
+            return
+        q_reference = np.asarray(q_reference, dtype=float).reshape(-1)
+        if q_reference.shape != (nq,) or not np.all(np.isfinite(q_reference)):
+            raise ValueError(f"IK reference q must contain {nq} finite values, got shape {q_reference.shape}")
+        self.q_reference = q_reference.copy()
+
     def scale_arms(self, human_left_pose, human_right_pose, human_arm_length=0.60, robot_arm_length=0.75):
         scale_factor = robot_arm_length / human_arm_length
         robot_left_pose = human_left_pose.copy()
@@ -261,6 +276,7 @@ class G1_29_ArmIK:
         self.opti.set_value(self.param_tf_l, left_wrist)
         self.opti.set_value(self.param_tf_r, right_wrist)
         self.opti.set_value(self.var_q_last, self.init_data) # for smooth
+        self.opti.set_value(self.var_q_ref, self.q_reference)
 
         try:
             sol = self.opti.solve()
