@@ -16,9 +16,9 @@ brainco_Num_Motors = 6
 BRAINCO_OPEN_Q = np.zeros(brainco_Num_Motors)
 # Normalized [thumb opposition, thumb bend, index, middle, ring, pinky].
 # 捏合姿态（146/147对应注释记得切换） Keep thumb/index partially bent for a pinch; tune their gap on the real hand.
-# BRAINCO_PINCH_Q = np.array([0.8, 0.6, 0.65, 1.0, 1.0, 1.0])
+BRAINCO_PINCH_Q = np.array([0.8, 0.6, 0.65, 1.0, 1.0, 1.0])
 # 伸出食指 Extend the index finger and close the other fingers for button pressing.
-BRAINCO_INDEX_ONLY_Q = np.array([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+# BRAINCO_INDEX_ONLY_Q = np.array([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
 kTopicbraincoLeftCommand = "rt/brainco/left/cmd"
 kTopicbraincoLeftState = "rt/brainco/left/state"
 kTopicbraincoRightCommand = "rt/brainco/right/cmd"
@@ -143,11 +143,11 @@ class Brainco_Controller:
 
                 if control_mode == "controller":
                     #捏合姿态
-                    # left_q_target = BRAINCO_PINCH_Q.copy() if self._read_button(left_index_button) else BRAINCO_OPEN_Q.copy()
-                    # right_q_target = BRAINCO_PINCH_Q.copy() if self._read_button(right_index_button) else BRAINCO_OPEN_Q.copy()
+                    left_q_target = BRAINCO_PINCH_Q.copy() if self._read_button(left_index_button) else BRAINCO_OPEN_Q.copy()
+                    right_q_target = BRAINCO_PINCH_Q.copy() if self._read_button(right_index_button) else BRAINCO_OPEN_Q.copy()
                     #伸出食指
-                    left_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(left_index_button) else BRAINCO_OPEN_Q.copy()
-                    right_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(right_index_button) else BRAINCO_OPEN_Q.copy()
+                    # left_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(left_index_button) else BRAINCO_OPEN_Q.copy()
+                    # right_q_target = BRAINCO_INDEX_ONLY_Q.copy() if self._read_button(right_index_button) else BRAINCO_OPEN_Q.copy()
                 else:
                     # get dual hand state
                     with left_hand_array.get_lock():

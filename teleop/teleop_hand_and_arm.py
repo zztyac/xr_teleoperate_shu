@@ -12,7 +12,7 @@ PC 端：
    python -m teleimager.image_client --host 192.168.123.164
 启动遥操作和数据录制：
 cd /home/ubuntu/zty/xr_teleoperate_shu
-motion: python teleop/teleop_hand_and_arm.py --record --motion --task-name turn_signal_stalk
+motion: python teleop/teleop_hand_and_arm.py --record --motion --task-name close_open_car
 debug : python teleop/teleop_hand_and_arm.py --record --task-name turn_signal_stalk
 
 G1_29 启动后保持当前双臂、腿和腰的位置，不读取初始姿态配置。
@@ -371,7 +371,7 @@ if __name__ == '__main__':
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = '/mnt/data/zty/json_data/', help = 'path to save data')
-    parser.add_argument('--task-name', type = str, default = 'turn_signal_stalk', help = 'task file name for recording')
+    parser.add_argument('--task-name', type = str, default = 'open_close_car', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'Push the turn signal stalk down.', help = 'task goal for recording at json file; selected subtask overrides this in turn_signal_stalk mode')
     parser.add_argument('--task-desc', type = str, default = 'Collect a demonstration of moving the turn signal stalk downward with the dexterous hand.', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: move the dexterous hand to the turn signal stalk; step2: align the fingers with the stalk; step3: push the stalk down; step4: release the stalk and return to a safe pose;', help = 'task steps for recording at json file')
