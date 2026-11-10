@@ -146,7 +146,21 @@ class G1_29_ArmIK:
         self.param_tf_l = self.opti.parameter(4, 4)
         self.param_tf_r = self.opti.parameter(4, 4)
         self.translational_cost = casadi.sumsqr(self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
-        self.rotation_cost = casadi.sumsqr(self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
+        # 姿态误差改用弦距离 0.5*||R - R_target||_F^2 = 2(1-cos θ)，在误差趋近 0 时与 log3 的 θ^2 一致。
+        # pinocchio-casadi 的 log3 在误差约 1e-8~1e-6 rad 时梯度会出现 NaN（Ipopt 报 Invalid_Number_Detected），
+        # 末端停在目标位姿附近（如回到初始姿态）时容易触发；弦距离处处光滑，不会出现该问题。
+        # rotational_error（log3）仍保留，仅用于诊断。
+        self.rotational_chordal_error = casadi.Function(
+            "rotational_chordal_error",
+            [self.cq, self.cTf_l, self.cTf_r],
+            [
+                casadi.vertcat(
+                    casadi.vec(self.cdata.oMf[self.L_hand_id].rotation - self.cTf_l[:3,:3]),
+                    casadi.vec(self.cdata.oMf[self.R_hand_id].rotation - self.cTf_r[:3,:3])
+                )
+            ],
+        )
+        self.rotation_cost = 0.5 * casadi.sumsqr(self.rotational_chordal_error(self.var_q, self.param_tf_l, self.param_tf_r))
         self.regularization_cost = casadi.sumsqr(self.var_q - self.var_q_ref)
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
