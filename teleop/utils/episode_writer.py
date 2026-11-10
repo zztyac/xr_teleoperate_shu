@@ -55,6 +55,8 @@ class EpisodeWriter():
         self.item_data_queue = Queue(-1)
         self.stop_worker = False
         self._worker_error = None
+        self._abort_reason = None
+        self.last_aborted_episode_dir = None
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
@@ -118,6 +120,7 @@ class EpisodeWriter():
             return False  # Return False if the class is unavailable
 
         # Reset episode-related data and create necessary directories
+        self._abort_reason = None
         self.item_id = -1
         self.episode_id = self.episode_id + 1
         
@@ -146,6 +149,8 @@ class EpisodeWriter():
         
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
         self.raise_if_failed()
+        if self._abort_reason is not None:
+            raise RuntimeError('Cannot append to an aborted recording episode.')
         for group_name, images in (("colors", colors), ("depths", depths)):
             for key, image in (images or {}).items():
                 if not self.is_valid_image(image):
@@ -172,7 +177,7 @@ class EpisodeWriter():
             try:
                 item_data = self.item_data_queue.get(timeout=1)
                 try:
-                    if self._worker_error is None:
+                    if self._worker_error is None and self._abort_reason is None:
                         self._process_item_data(item_data)
                 except Exception as e:
                     self._worker_error = e
@@ -182,8 +187,16 @@ class EpisodeWriter():
             except Empty:
                 pass
         
-            # Check if save_episode was triggered
-            if self.need_save and self.item_data_queue.empty():
+            # Abort is processed by the writer, after any in-flight image write.
+            # The control loop only requests it and never waits for disk I/O.
+            if self._abort_reason is not None and not self.is_available and self.item_data_queue.empty():
+                if self._worker_error is None:
+                    try:
+                        self._quarantine_aborted_episode()
+                    except Exception as e:
+                        self._worker_error = e
+                        logger_mp.error(f'Failed to quarantine aborted episode: {e}')
+            elif self.need_save and self.item_data_queue.empty():
                 if self._worker_error is not None:
                     self.need_save = False
                 else:
@@ -261,8 +274,41 @@ class EpisodeWriter():
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
         self.raise_if_failed()
+        if self._abort_reason is not None:
+            raise RuntimeError('Cannot save an aborted episode as a successful recording.')
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
+
+    def abort_episode(self, reason):
+        """Request asynchronous quarantine; never interrupt the robot loop."""
+        self.raise_if_failed()
+        if self.is_available or self._abort_reason is not None:
+            return
+        self.need_save = False
+        self._abort_reason = str(reason)
+        logger_mp.error(
+            f'[采集已中止] {self.episode_dir}: {reason}。本段将移出正常数据目录，'
+            '图像恢复后需重新按 Enter 录制。'
+        )
+
+    def _quarantine_aborted_episode(self):
+        import shutil
+        reason = self._abort_reason
+        # Preserve partial evidence, explicitly marked invalid, outside task_dir.
+        with open(self.json_path, 'a', encoding='utf-8') as f:
+            f.write('\n],\n"status": "aborted",\n"failure_reason": ')
+            f.write(json.dumps(reason, ensure_ascii=False))
+            f.write('\n}')
+        quarantine_root = self.task_dir.rstrip(os.sep) + '_invalid'
+        os.makedirs(quarantine_root, exist_ok=True)
+        destination = os.path.join(
+            quarantine_root, f'{os.path.basename(self.episode_dir)}_{time.time_ns()}'
+        )
+        shutil.move(self.episode_dir, destination)
+        self.last_aborted_episode_dir = destination
+        self.need_save = False
+        self.is_available = True
+        logger_mp.error(f'[异常片段已隔离] {destination}；不作为正常示范保存。')
 
     def _save_episode(self):
         """
@@ -281,7 +327,7 @@ class EpisodeWriter():
         """
         try:
             self.item_data_queue.join()
-            if not self.is_available and self._worker_error is None:
+            if not self.is_available and self._worker_error is None and self._abort_reason is None:
                 self.need_save = True
             while not self.is_available and self._worker_error is None:
                 time.sleep(0.01)

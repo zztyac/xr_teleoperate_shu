@@ -109,6 +109,7 @@ from teleop.robot_control.robot_arm import (
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.image_stream_guard import ImageStreamGuard
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
@@ -715,7 +716,29 @@ def resolve_initial_full_body_q(args):
     return initial_full_body_q
 
 
-def collect_recording_images(camera_config, camera_frames):
+def read_recording_camera_frames(img_client, camera_config):
+    getters = {
+        'head_camera': img_client.get_head_frame,
+        'left_wrist_camera': img_client.get_left_wrist_frame,
+        'right_wrist_camera': img_client.get_right_wrist_frame,
+        'right_side_camera': img_client.get_right_side_frame,
+    }
+    return {name: getter() for name, getter in getters.items()
+            if camera_config.get(name, {}).get('enable_zmq', False)}
+
+
+def update_recording_image_guard(image_guard, camera_frames, recorder=None):
+    global RECORD_RUNNING, RECORD_TOGGLE
+    image_guard.update(camera_frames)
+    if RECORD_RUNNING and image_guard.failed:
+        # Stop accepting records immediately; the disk worker quarantines the
+        # current episode asynchronously. Robot control continues as before.
+        RECORD_RUNNING = False
+        RECORD_TOGGLE = False
+        recorder.abort_episode(image_guard.failure_reason)
+
+
+def collect_recording_images(camera_config, camera_frames, max_frame_age=1.0):
     """Keep camera slots stable and reject frames with missing enabled images."""
     colors = {}
     missing = []
@@ -729,7 +752,13 @@ def collect_recording_images(camera_config, camera_frames):
     for name, slot in camera_slots.items():
         if not camera_config.get(name, {}).get("enable_zmq", False):
             continue
-        image = getattr(camera_frames.get(name), "bgr", None)
+        frame = camera_frames.get(name)
+        image = getattr(frame, "bgr", None)
+        if hasattr(frame, 'received_at'):
+            received_at = frame.received_at
+            if received_at is None or not 0 <= time.monotonic() - received_at < max_frame_age:
+                missing.append(name)
+                continue
         if not EpisodeWriter.is_valid_image(image):
             missing.append(name)
             continue
@@ -793,6 +822,11 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.record and getattr(ImageClient, 'FRAME_HEALTH_VERSION', 0) < 1:
+        parser.error(
+            '当前 Python 加载了未更新的 teleimager，缺少图像断流保护；请使用 tv 环境并重启采集。'
+            f'实际加载位置：{sys.modules[ImageClient.__module__].__file__}'
+        )
     if args.debug_full_body and args.debug_arms_only:
         parser.error("--debug-full-body and --debug-arms-only cannot be used together.")
     if args.debug_full_body and args.motion:
@@ -829,6 +863,11 @@ if __name__ == '__main__':
     button_subtask_mode = args.record and bool(BUTTON_SUBTASKS)
     logger_mp.debug(f"args: {args}")
 
+    img_client = None
+    arm_ctrl = None
+    tv_wrapper = None
+    recorder = None
+    image_guard = None
     try:
         # setup dds communication domains id
         if args.sim:
@@ -851,6 +890,16 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
+        if args.record:
+            image_guard = ImageStreamGuard(
+                camera_config, args.img_server_ip, logger_mp, EpisodeWriter.is_valid_image
+            )
+            logger_mp.info(
+                f'[图像断流保护已启用] {image_guard.VERSION}；超时 1 秒中止并隔离本段，'
+                f'图像恢复后需重新按 Enter。客户端：{sys.modules[ImageClient.__module__].__file__}'
+            )
+            # Verify live images before constructing robot controllers.
+            image_guard.wait_until_ready(lambda: read_recording_camera_frames(img_client, camera_config))
         right_side_camera_enabled = camera_config.get('right_side_camera', {}).get('enable_zmq', False)
         left_wrist_camera_enabled = camera_config.get('left_wrist_camera', {}).get('enable_zmq', False)
         right_wrist_camera_enabled = camera_config.get('right_wrist_camera', {}).get('enable_zmq', False)
@@ -1058,6 +1107,10 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            if image_guard is not None:
+                update_recording_image_guard(
+                    image_guard, read_recording_camera_frames(img_client, camera_config)
+                )
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
@@ -1092,11 +1145,24 @@ if __name__ == '__main__':
                 if args.record:
                     right_wrist_img = img_client.get_right_wrist_frame()
 
+            if image_guard is not None:
+                update_recording_image_guard(image_guard, {
+                    'head_camera': head_img,
+                    'left_wrist_camera': left_wrist_img,
+                    'right_wrist_camera': right_wrist_img,
+                    'right_side_camera': right_side_img,
+                }, recorder)
+
             # enter 只切换录制状态；真正的 episode 文本标签在 create_episode() 前写入。
             # 这样每段数据都固定绑定开始录制时选中的子任务，录制中禁止切换。
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
-                if not RECORD_RUNNING:
+                if not RECORD_RUNNING and not image_guard.ready:
+                    logger_mp.error(
+                        '[无法开始录制] 相机图像尚未全部恢复：' + image_guard.failure_reason
+                        + '。请检查图像服务；恢复后重新按 Enter。'
+                    )
+                elif not RECORD_RUNNING:
                     if button_subtask_mode:
                         subtask = get_current_button_subtask()
                         recorder.text = {
@@ -1207,7 +1273,7 @@ if __name__ == '__main__':
 
             # record data
             if args.record:
-                READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
+                READY = recorder.is_ready() and image_guard.ready
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":
                     with dual_hand_data_lock:
@@ -1378,7 +1444,8 @@ if __name__ == '__main__':
     finally:
         clear_pressed_keys()
         try:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            if arm_ctrl is not None:
+                arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
@@ -1398,7 +1465,8 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close image client: {e}")
 
         try:
-            tv_wrapper.close()
+            if tv_wrapper is not None:
+                tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
@@ -1417,7 +1485,7 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
         try:
-            if args.record:
+            if args.record and recorder is not None:
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
