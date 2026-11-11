@@ -25,6 +25,9 @@ H1_Num_Motors = 20
 H2_Num_Motors = 35
 G1_29_Valid_Motors = 29
 G1_Mode_PR = 0
+# motion 模式（站立、运控在线）退出时手臂慢速回到启动姿态的关节速度上限，避免甩臂影响平衡。
+MOTION_GO_HOME_VELOCITY_LIMIT = 0.5  # rad/s
+MOTION_GO_HOME_TIMEOUT_S = 15.0
 G1_29_LowLevel_Kp = [
     60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
     60.0, 60.0, 60.0, 100.0, 40.0, 40.0,
@@ -101,6 +104,7 @@ class G1_29_ArmController:
         body_velocity_limit = 0.5,
         body_ramp_duration = 6.0,
         hold_measured_legs = False,
+        target_interp_time = 0.0,
     ):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.motion_mode = motion_mode
@@ -114,9 +118,13 @@ class G1_29_ArmController:
         if self.body_velocity_limit <= 0:
             raise ValueError("[G1_29_ArmController] body_velocity_limit must be greater than 0.")
         self.body_ramp_duration = float(body_ramp_duration)
+        # >0 时，250 Hz 发布线程在相邻两次 30 Hz 关节目标之间线性插值，消除每 33 ms 一次的台阶式跳变。
+        self.target_interp_time = max(0.0, float(target_interp_time))
         if self.body_ramp_duration < 0:
             raise ValueError("[G1_29_ArmController] body_ramp_duration must be greater than or equal to 0.")
 
+        # initial_target_q=None：不设初始姿态，双臂从启动时实测角度开始，并以它作为回位目标。
+        self.hold_startup_arms = initial_target_q is None
         self.initial_target_q = _resolve_initial_target_q(initial_target_q, 14, "G1_29_ArmController")
         self.initial_full_body_q = (
             _resolve_initial_target_q(initial_full_body_q, len(G1_29_JointIndex), "G1_29_ArmController initial_full_body_q")
@@ -171,6 +179,10 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        if self.hold_startup_arms:
+            self.initial_target_q = self.get_current_dual_arm_q().copy()
+            self.q_target = self.initial_target_q.copy()
+            logger_mp.info("No initial arm pose: hold the arm joints measured at startup.")
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
 
@@ -225,6 +237,10 @@ class G1_29_ArmController:
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
         logger_mp.info("Lock OK!")
+
+        self._interp_from = np.array(self.q_target, dtype=float).copy()
+        self._interp_to = self._interp_from.copy()
+        self._interp_t0 = 0.0
 
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
@@ -318,9 +334,13 @@ class G1_29_ArmController:
                 self.msg.mode_machine = self.get_mode_machine()
 
             with self.ctrl_lock:
-                arm_q_target     = self.q_target
+                arm_q_target     = self._interpolated_arm_target(start_time)
                 arm_tauff_target = self.tauff_target
                 full_body_q_target = self.full_body_q_target.copy() if self.control_full_body else None
+            if self.control_full_body and self.target_interp_time > 0.0:
+                # debug 全身控制时手臂目标同样走插值，腿/腰仍按原来的 ramp 处理。
+                for idx, id in enumerate(G1_29_JointArmIndex):
+                    full_body_q_target[id.value] = arm_q_target[idx]
 
             if self.control_full_body:
                 if self.simulation_mode:
@@ -361,10 +381,25 @@ class G1_29_ArmController:
             # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
             # logger_mp.debug(f"sleep_time:{sleep_time}")
 
+    def _interpolated_arm_target(self, now):
+        '''Arm target to command at time now (caller holds ctrl_lock).'''
+        if self.target_interp_time <= 0.0:
+            return self.q_target
+        alpha = min(1.0, max(0.0, (now - self._interp_t0) / self.target_interp_time))
+        return self._interp_from + alpha * (self._interp_to - self._interp_from)
+
+    def _set_arm_q_target(self, q_target):
+        '''Start a new interpolation segment toward q_target (caller holds ctrl_lock).'''
+        now = time.time()
+        self._interp_from = np.array(self._interpolated_arm_target(now), dtype=float).copy()
+        self._interp_to = np.array(q_target, dtype=float).copy()
+        self._interp_t0 = now
+        self.q_target = q_target
+
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
         with self.ctrl_lock:
-            self.q_target = q_target
+            self._set_arm_q_target(q_target)
             self.tauff_target = tauff_target
             if self.control_full_body:
                 for idx, id in enumerate(G1_29_JointArmIndex):
@@ -397,26 +432,38 @@ class G1_29_ArmController:
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their initial target position.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
+        if self.motion_mode:
+            # 站立时慢速回位；超时也照样把 arm_sdk 权重降到 0，平滑交还给运控，而不是进程退出后突然切换。
+            max_attempts = int(MOTION_GO_HOME_TIMEOUT_S / 0.05)
+            with self.ctrl_lock:
+                self._speed_gradual_max = False
+                self.arm_velocity_limit = MOTION_GO_HOME_VELOCITY_LIMIT
+        else:
+            max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = self.initial_target_q.copy()
+            self._set_arm_q_target(self.initial_target_q.copy())
             if self.control_full_body:
                 for idx, id in enumerate(G1_29_JointArmIndex):
                     self.full_body_q_target[id.value] = self.initial_target_q[idx]
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
+        reached = False
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
             if np.all(np.abs(current_q - self.initial_target_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
+                reached = True
                 logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
                 break
             current_attempts += 1
             time.sleep(0.05)
+        if not reached:
+            logger_mp.warning("[G1_29_ArmController] arms did not reach the home position before the timeout.")
+        if self.motion_mode:
+            for weight in np.linspace(1, 0, num=101):
+                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
+                time.sleep(0.02)
+            logger_mp.info("[G1_29_ArmController] arm_sdk weight ramped to 0; arms returned to the motion controller.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''

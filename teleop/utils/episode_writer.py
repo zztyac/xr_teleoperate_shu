@@ -11,9 +11,12 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True,
+                 collection_meta=None):
         """
         image_size: [width, height]
+        collection_meta: JSON-serializable dict written to every episode as info.collection
+                         (code version, mode, initial pose, keyboard tuning, ...).
         """
         logger_mp.info("==> EpisodeWriter initializing...\n")
         self.task_dir = task_dir
@@ -49,6 +52,8 @@ class EpisodeWriter():
             os.makedirs(self.task_dir)
             logger_mp.info(f"==> episode directory does not exist, now create one.\n")
         self.data_info()
+        if collection_meta is not None:
+            self.info["collection"] = collection_meta
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
@@ -56,6 +61,7 @@ class EpisodeWriter():
         self.stop_worker = False
         self._worker_error = None
         self._abort_reason = None
+        self._abort_by_operator = False
         self.last_aborted_episode_dir = None
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
@@ -121,6 +127,7 @@ class EpisodeWriter():
 
         # Reset episode-related data and create necessary directories
         self._abort_reason = None
+        self._abort_by_operator = False
         self.item_id = -1
         self.episode_id = self.episode_id + 1
         
@@ -279,17 +286,28 @@ class EpisodeWriter():
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
 
-    def abort_episode(self, reason):
-        """Request asynchronous quarantine; never interrupt the robot loop."""
+    def abort_episode(self, reason, by_operator=False):
+        """Request asynchronous quarantine; never interrupt the robot loop.
+
+        by_operator=True: the operator discarded this attempt (x key). The partial episode is still moved
+        to <task_dir>_invalid, and its episode number is reused by the next recording.
+        """
         self.raise_if_failed()
         if self.is_available or self._abort_reason is not None:
             return
         self.need_save = False
+        self._abort_by_operator = bool(by_operator)
         self._abort_reason = str(reason)
-        logger_mp.error(
-            f'[采集已中止] {self.episode_dir}: {reason}。本段将移出正常数据目录，'
-            '图像恢复后需重新按 Enter 录制。'
-        )
+        if by_operator:
+            logger_mp.warning(
+                f'[已丢弃] {self.episode_dir}: {reason}。本段移到 {self.task_dir.rstrip(os.sep)}_invalid，'
+                '不作为示范保存；可直接按 Enter 重新录制（沿用同一编号）。'
+            )
+        else:
+            logger_mp.error(
+                f'[采集已中止] {self.episode_dir}: {reason}。本段将移出正常数据目录，'
+                '图像恢复后需重新按 Enter 录制。'
+            )
 
     def _quarantine_aborted_episode(self):
         import shutil
@@ -306,6 +324,9 @@ class EpisodeWriter():
         )
         shutil.move(self.episode_dir, destination)
         self.last_aborted_episode_dir = destination
+        if self._abort_by_operator:
+            # The directory is gone from task_dir, so the next recording takes the same number.
+            self.episode_id -= 1
         self.need_save = False
         self.is_available = True
         logger_mp.error(f'[异常片段已隔离] {destination}；不作为正常示范保存。')

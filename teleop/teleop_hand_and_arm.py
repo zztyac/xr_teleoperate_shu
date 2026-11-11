@@ -12,6 +12,15 @@ cd /home/ubuntu/zty/xr_teleoperate_shu
 1. 验证摄像头正常连接：python -m teleimager.image_client --host 192.168.123.164
 2. 启动遥操作和数据录制：
 debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle_physical_button_press_zty --initial-pose-task-name vehicle_physical_button_press_0903 --headless
+motion模式（站立，先用遥控器进入常规运控模式）： python teleop/teleop_hand_and_arm.py --motion --record --task-name <任务名> --keyboard-arm right --headless
+  motion 模式不设初始姿态：双臂从启动时的实测角度开始，空格回位和退出回位都回到这个启动姿态；
+  腿和腰由运控负责，退出时手臂慢速回到启动姿态后把 arm_sdk 权重平滑降到 0，交还运控。
+  不加 --motion 时若检测到机器人站立（两膝 < 1.0 rad），程序拒绝进入 debug 模式，避免释放运控导致摔倒。
+键盘控制平滑：两种模式默认都有按键加减速（不再瞬间启停）和 0.12 s 松键判定（终端没有松键事件，靠按键重复间隔判断）。
+  关节目标 250 Hz 插值只在 motion 默认开；debug 默认关，与推理端和已有坐姿数据的执行方式一致（--smooth-joint-targets 可开）。
+  速度：debug 2.5 cm/s、0.30 rad/s（与已有数据一致），motion 5 cm/s、0.5 rad/s。都可用 --keyboard-* 参数单独调。
+无相机测试：加 --no-camera（不连接相机 server，不能与 --record 同用），例如
+  python teleop/teleop_hand_and_arm.py --motion --no-camera --keyboard-arm right --headless
 
 # 1 163-164
 # 2 167-168
@@ -25,6 +34,7 @@ debug模式： python teleop/teleop_hand_and_arm.py --record --task-name vehicle
   r      开始机器人跟随键盘 / XR 运动
   q      停止并退出程序
   enter  开始录制当前 episode，或保存正在录制的 episode
+  x      录制中丢弃当前 episode（移到 <task>_invalid，不保存，下一条沿用同一编号）
   n / p  录制前切换到下一个 / 上一个按键子任务
   1-6    录制前直接选择对应的按键子任务
   w / s  末端沿机器人 X 轴正 / 负方向持续移动
@@ -111,7 +121,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.image_stream_guard import ImageStreamGuard
 from teleop.utils.ipc import IPC_Server
-from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper, read_leg_q, debug_mode_refusal
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -129,6 +139,7 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+DISCARD_REQUEST = False  # x pressed while recording: drop the current episode instead of saving it
 CURRENT_BUTTON_SUBTASK_IDX = 0
 PRESSED_KEYS = set()
 PRESSED_KEYS_LOCK = threading.Lock()
@@ -311,6 +322,19 @@ def orthonormalize_rotation(rotation):
     return result
 
 
+def approach_velocity(velocity, desired, accel, dt):
+    """Move velocity toward desired by at most accel*dt (vector norm); accel <= 0 jumps instantly."""
+    desired = np.asarray(desired, dtype=float)
+    if accel <= 0.0:
+        return desired.copy()
+    delta = desired - velocity
+    distance = np.linalg.norm(delta)
+    step = accel * dt
+    if distance <= step:
+        return desired.copy()
+    return velocity + delta / distance * step
+
+
 class KeyboardEndEffectorController:
     def __init__(
         self,
@@ -319,10 +343,17 @@ class KeyboardEndEffectorController:
         angular_speed=0.175,
         initial_left_target=None,
         initial_right_target=None,
+        linear_accel=0.0,
+        angular_accel=0.0,
     ):
         self.control_arm = control_arm
         self.linear_speed = linear_speed
         self.angular_speed = angular_speed
+        # 加速度 >0 时按键启停按加速度平滑过渡；0 保持原来的瞬间启停。
+        self.linear_accel = float(linear_accel)
+        self.angular_accel = float(angular_accel)
+        self.linear_velocity = np.zeros(3)
+        self.angular_velocity = np.zeros(3)
         self.initial_left_target = (
             None if initial_left_target is None else np.array(initial_left_target, dtype=float, copy=True)
         )
@@ -393,6 +424,8 @@ class KeyboardEndEffectorController:
         self._ensure_targets(left_wrist_pose, right_wrist_pose)
 
         if return_home_active or KEYBOARD_RETURN_HOME_KEYS & pressed_keys:
+            self.linear_velocity = np.zeros(3)
+            self.angular_velocity = np.zeros(3)
             return_home_done = True
             for pose, initial_pose in self._target_initial_pose_pairs():
                 return_home_done = self._step_pose_toward_initial(pose, initial_pose, dt) and return_home_done
@@ -415,13 +448,18 @@ class KeyboardEndEffectorController:
         if rotation_norm > 1.0:
             rotation_dir /= rotation_norm
 
-        translation_delta = translation_dir * self.linear_speed * dt
-        rotation_delta = rotation_matrix_from_rotvec(rotation_dir * self.angular_speed * dt)
+        self.linear_velocity = approach_velocity(
+            self.linear_velocity, translation_dir * self.linear_speed, self.linear_accel, dt)
+        self.angular_velocity = approach_velocity(
+            self.angular_velocity, rotation_dir * self.angular_speed, self.angular_accel, dt)
+        translation_delta = self.linear_velocity * dt
+        rotation_vec = self.angular_velocity * dt
 
-        if np.any(translation_delta) or rotation_norm > 0.0:
+        if np.any(translation_delta) or np.any(rotation_vec):
+            rotation_delta = rotation_matrix_from_rotvec(rotation_vec)
             for pose in self._target_poses():
                 pose[:3, 3] += translation_delta
-                if rotation_norm > 0.0:
+                if np.any(rotation_vec):
                     pose[:3, :3] = orthonormalize_rotation(rotation_delta @ pose[:3, :3])
 
         return self.left_target.copy(), self.right_target.copy(), False
@@ -432,6 +470,30 @@ class KeyboardEndEffectorController:
         if self.control_arm == "both":
             return action_active, action_active
         return False, action_active
+
+
+# 未显式指定时按模式选默认值：(debug 坐姿, motion 站立)。
+# 加减速和松键判定两种模式都开；debug 速度保持 2.5 cm/s / 0.30 rad/s，与已有 300 多条坐姿数据一致。
+# 关节插值只在 motion 默认开：debug 关掉，使采集时“每 33 ms 一个目标、电机保持”的执行方式与推理端
+# 及已有数据一致（插值会让关节状态相对 action 多滞后约 1 帧）。
+KEYBOARD_TUNING_DEFAULTS = {
+    "keyboard_linear_speed": (0.025, 0.05),    # m/s
+    "keyboard_angular_speed": (0.30, 0.50),    # rad/s
+    "keyboard_linear_accel": (0.15, 0.15),     # m/s^2, 0 = instant start/stop
+    "keyboard_angular_accel": (1.5, 1.5),      # rad/s^2
+    "keyboard_release_gap": (0.12, 0.12),      # s without a key-repeat before a key counts as released
+}
+
+
+def resolve_keyboard_tuning(args):
+    """Fill keyboard/joint smoothing options left as None with the defaults of the current mode."""
+    index = 1 if args.motion else 0
+    for name, defaults in KEYBOARD_TUNING_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, defaults[index])
+    if args.smooth_joint_targets is None:
+        args.smooth_joint_targets = bool(args.motion)
+    return args
 
 
 def load_button_subtasks_from_config(task_name: str) -> list[dict]:
@@ -495,7 +557,7 @@ def select_button_subtask(index: int):
 
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, DISCARD_REQUEST
     key = normalize_key(key)
     if key in KEYBOARD_RETURN_HOME_KEYS:
         start_keyboard_return_home()
@@ -516,6 +578,11 @@ def on_press(key):
         clear_pressed_keys()
     elif key in ('enter', 'return', '\n') and START == True:
         RECORD_TOGGLE = True
+    elif key == 'x':
+        if RECORD_RUNNING:
+            DISCARD_REQUEST = True
+        else:
+            logger_mp.warning("[x] 只在录制中有效：丢弃当前 episode。")
     elif key == 'n':
         select_button_subtask(CURRENT_BUTTON_SUBTASK_IDX + 1)
     elif key == 'p':
@@ -716,6 +783,17 @@ def resolve_initial_full_body_q(args):
     return initial_full_body_q
 
 
+def no_camera_config():
+    """Camera config with every stream disabled, for --no-camera runs (no image server needed)."""
+    disabled = {'enable_zmq': False, 'enable_webrtc': False}
+    return {
+        'head_camera': {**disabled, 'binocular': False, 'image_shape': [480, 640], 'webrtc_port': 0},
+        'left_wrist_camera': dict(disabled),
+        'right_wrist_camera': dict(disabled),
+        'right_side_camera': dict(disabled),
+    }
+
+
 def read_recording_camera_frames(img_client, camera_config):
     getters = {
         'head_camera': img_client.get_head_frame,
@@ -725,6 +803,53 @@ def read_recording_camera_frames(img_client, camera_config):
     }
     return {name: getter() for name, getter in getters.items()
             if camera_config.get(name, {}).get('enable_zmq', False)}
+
+
+def git_state(repo_dir):
+    """Branch, commit and whether tracked files differ from it; never raises."""
+    import subprocess
+
+    def git(*command):
+        return subprocess.run(["git", "-C", repo_dir, *command], capture_output=True, text=True,
+                              timeout=5, check=True).stdout.strip()
+    try:
+        return {
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "commit": git("rev-parse", "HEAD"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_collection_meta(args, start_arm_q, control_full_body, repo_dir, argv):
+    """How this session collects data; written to every episode as info.collection."""
+    return {
+        "schema": 1,
+        "code": git_state(repo_dir),
+        "argv": list(argv),
+        "mode": "motion" if args.motion else "debug",
+        "arm": args.arm,
+        "ee": args.ee,
+        "input_mode": args.input_mode,
+        "frequency": args.frequency,
+        # motion：启动时实测的双臂角度；debug：initial_target_poses.json 中的姿态名。
+        "initial_pose": "measured_at_start" if args.motion else args.initial_pose_task_name,
+        "start_arm_q": [round(float(v), 5) for v in start_arm_q] if start_arm_q is not None else None,
+        "control_full_body": bool(control_full_body),
+        "hold_seated_legs": bool(args.hold_seated_legs) if control_full_body else None,
+        "keyboard": {
+            "arm": args.keyboard_arm,
+            "linear_speed": args.keyboard_linear_speed,
+            "angular_speed": args.keyboard_angular_speed,
+            "linear_accel": args.keyboard_linear_accel,
+            "angular_accel": args.keyboard_angular_accel,
+            "release_gap": args.keyboard_release_gap,
+            "repeat_delay": args.keyboard_repeat_delay,
+            "ik_reference": args.keyboard_ik_reference,
+        },
+        "smooth_joint_targets": bool(args.smooth_joint_targets),
+    }
 
 
 def update_recording_image_guard(image_guard, camera_frames, recorder=None):
@@ -783,19 +908,39 @@ if __name__ == '__main__':
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
     parser.add_argument('--keyboard-arm', type=str, choices=['left', 'right', 'both'], default='right',
                         help='Arm end-effector controlled by keyboard in controller input mode.')
-    parser.add_argument('--keyboard-linear-speed', type=float, default=0.025,
-                        help='Keyboard end-effector translation speed in m/s.')
-    parser.add_argument('--keyboard-angular-speed', type=float, default=0.30,
-                        help='Keyboard end-effector rotation speed in rad/s.')
+    parser.add_argument('--keyboard-linear-speed', type=float, default=None,
+                        help='Keyboard end-effector translation speed in m/s (default 0.025 debug / 0.05 motion).')
+    parser.add_argument('--keyboard-angular-speed', type=float, default=None,
+                        help='Keyboard end-effector rotation speed in rad/s (default 0.30 debug / 0.50 motion).')
+    parser.add_argument('--keyboard-linear-accel', type=float, default=None,
+                        help='Keyboard translation acceleration in m/s^2; 0 = instant start/stop '
+                             '(default 0.15).')
+    parser.add_argument('--keyboard-angular-accel', type=float, default=None,
+                        help='Keyboard rotation acceleration in rad/s^2; 0 = instant (default 1.5).')
+    parser.add_argument('--keyboard-release-gap', type=float, default=None,
+                        help='Seconds without a key-repeat before a held key counts as released '
+                             '(default 0.12). Must exceed the OS key-repeat interval.')
+    parser.add_argument('--keyboard-repeat-delay', type=float, default=0.75,
+                        help='Seconds to wait for the first key-repeat (must exceed the OS repeat delay). '
+                             'A short tap moves for this long; lower it together with the OS repeat delay.')
+    parser.add_argument('--smooth-joint-targets', action=argparse.BooleanOptionalAction, default=None,
+                        help='Interpolate arm joint targets between control frames at 250 Hz (default on in motion mode, off in debug mode).')
     parser.add_argument('--keyboard-ik-reference', type=str, choices=['initial', 'zero'], default='initial',
                         help='Null-space reference of the IK regularizer in keyboard mode. '
                              'initial: pull redundant joints toward initial_target_q so returning home restores '
                              'the configured joint angles; zero: original behavior (pull toward all-zero joints).')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], default='brainco', help='Select end effector controller')
+    parser.add_argument('--no-camera', action='store_true',
+                        help='Do not connect to the image server (control tests without cameras). '
+                             'XR uses pass-through; cannot be combined with --record.')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
-    parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
+    parser.add_argument('--motion', action = 'store_true',
+                        help='Enable motion control mode (robot standing, motion service on). Arms start from '
+                             'their measured pose; --initial-pose-task-name is ignored.')
+    parser.add_argument('--allow-debug-while-standing', action='store_true',
+                        help='Skip the standing check before entering debug mode. Only when the robot is hung on a gantry.')
     parser.add_argument('--debug-full-body', action='store_true',
                         help='In debug mode, explicitly control G1_29 legs and waist from all_joint_q while arms remain IK-controlled.')
     parser.add_argument('--debug-arms-only', action='store_true',
@@ -822,6 +967,9 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: move the BrainCo dexterous hand to the target button; step2: align the fingertip with the button surface; step3: press the button; step4: release and return to a safe pose;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    resolve_keyboard_tuning(args)
+    if args.no_camera and args.record:
+        parser.error("--no-camera cannot be used with --record: episodes need camera images.")
     if args.record and getattr(ImageClient, 'FRAME_HEALTH_VERSION', 0) < 1:
         parser.error(
             '当前 Python 加载了未更新的 teleimager，缺少图像断流保护；请使用 tv 环境并重启采集。'
@@ -839,7 +987,8 @@ if __name__ == '__main__':
         parser.error("--debug-full-body-ramp-duration must be greater than or equal to 0.")
 
     try:
-        initial_target_q = resolve_initial_target_q(args)
+        # motion 模式不设初始姿态（None → 控制器保持启动时实测的双臂角度）。
+        initial_target_q = None if args.motion else resolve_initial_target_q(args)
         control_debug_full_body = False
         initial_full_body_q = None
         auto_debug_full_body = (not args.motion and args.arm == "G1_29" and not args.debug_arms_only)
@@ -882,13 +1031,19 @@ if __name__ == '__main__':
         # sshkeyboard communication mode
         else:
             listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
-                                                      kwargs={"on_press": on_press, "on_release": on_release, "until": None, "sequential": False,}, 
+                                                      kwargs={"on_press": on_press, "on_release": on_release, "until": None, "sequential": False,
+                                                              "delay_second_char": args.keyboard_repeat_delay,
+                                                              "delay_other_chars": args.keyboard_release_gap},
                                                       daemon=True)
             listen_keyboard_thread.start()
 
         # image client
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-        camera_config = img_client.get_cam_config()
+        if args.no_camera:
+            camera_config = no_camera_config()
+            logger_mp.warning("--no-camera: image server not used; XR runs in pass-through and nothing is recorded.")
+        else:
+            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+            camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         if args.record:
             image_guard = ImageStreamGuard(
@@ -912,7 +1067,7 @@ if __name__ == '__main__':
                                      # maybe should decrease fps for better performance?
                                      # https://github.com/unitreerobotics/xr_teleoperate/issues/172
                                      # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
-                                     display_mode=args.display_mode,
+                                     display_mode='pass-through' if args.no_camera else args.display_mode,
                                      zmq=camera_config['head_camera']['enable_zmq'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
@@ -920,9 +1075,23 @@ if __name__ == '__main__':
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
+            logger_mp.info("Motion mode: no initial pose; arms start from the measured joint angles.")
+            if not args.sim:
+                status, result = MotionSwitcher().msc.CheckMode()
+                mode_name = result.get('name') if isinstance(result, dict) else None
+                if status != 0 or not mode_name:
+                    raise RuntimeError(
+                        f"--motion needs the Unitree motion service running (CheckMode status={status}, "
+                        f"result={result}). Enter regular motion mode with the remote first."
+                    )
+                logger_mp.info(f"Motion service active: {mode_name}")
             if args.input_mode == "controller":
                 loco_wrapper = LocoClientWrapper()
         else:
+            if not args.sim and not args.allow_debug_while_standing:
+                refusal = debug_mode_refusal(read_leg_q())
+                if refusal:
+                    raise RuntimeError(refusal)
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
@@ -945,6 +1114,7 @@ if __name__ == '__main__':
                 body_velocity_limit=args.debug_full_body_velocity_limit,
                 body_ramp_duration=args.debug_full_body_ramp_duration,
                 hold_measured_legs=args.hold_seated_legs,
+                target_interp_time=(1.0 / args.frequency) if args.smooth_joint_targets else 0.0,
             )
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
@@ -1035,6 +1205,13 @@ if __name__ == '__main__':
                 angular_speed=args.keyboard_angular_speed,
                 initial_left_target=keyboard_initial_left_pose,
                 initial_right_target=keyboard_initial_right_pose,
+                linear_accel=args.keyboard_linear_accel,
+                angular_accel=args.keyboard_angular_accel,
+            )
+            logger_mp.info(
+                f"Keyboard tuning: {args.keyboard_linear_speed} m/s, {args.keyboard_angular_speed} rad/s, "
+                f"accel {args.keyboard_linear_accel} m/s^2 / {args.keyboard_angular_accel} rad/s^2, "
+                f"release gap {args.keyboard_release_gap}s, joint interpolation {'on' if args.smooth_joint_targets else 'off'}."
             )
             # 7 自由度手臂对同一末端位姿有无穷多组关节解。原正则项把冗余自由度拉向全零，
             # 使空格回位时末端到位但关节构型偏离 initial_target_q（手看起来比初始姿态低）。
@@ -1072,12 +1249,16 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            collection_meta = build_collection_meta(
+                args, getattr(arm_ctrl, "initial_target_q", None), control_debug_full_body, parent_dir, sys.argv[1:])
+            logger_mp.info(f"Collection metadata: {json.dumps(collection_meta, ensure_ascii=False)}")
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
-                                     rerun_log = not args.headless)
+                                     rerun_log = not args.headless,
+                                     collection_meta = collection_meta)
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -1088,7 +1269,7 @@ if __name__ == '__main__':
                 "tap [space] to return home and open hand; tap [f] to toggle press."
             )
         if args.record:
-            logger_mp.info("🟡  Press [enter] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("🟡  Press [enter] to START or SAVE recording (toggle cycle); [x] discards the current episode.")
             if button_subtask_mode:
                 logger_mp.info(
                     f"🟡  Press [n]/[p] to switch button subtask, or [1]-[{len(BUTTON_SUBTASKS)}] "
@@ -1155,6 +1336,12 @@ if __name__ == '__main__':
 
             # enter 只切换录制状态；真正的 episode 文本标签在 create_episode() 前写入。
             # 这样每段数据都固定绑定开始录制时选中的子任务，录制中禁止切换。
+            if args.record and DISCARD_REQUEST:
+                DISCARD_REQUEST = False
+                if RECORD_RUNNING:
+                    RECORD_RUNNING = False
+                    RECORD_TOGGLE = False
+                    recorder.abort_episode("operator discarded the episode (x)", by_operator=True)
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING and not image_guard.ready:
